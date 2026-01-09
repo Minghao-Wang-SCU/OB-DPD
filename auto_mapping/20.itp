@@ -1,0 +1,27 @@
+[moleculetype]
+MOL    2
+
+[atoms]
+    1  SP2    1  MOL  CG1    1     0.000    45.000;Nc1ccccn1
+    2   P2    1  MOL  CG2    2     0.000    72.000;C=O
+    3   P3    1  MOL  CG3    3     0.000    72.000;C#CCC
+    4   Nd    1  MOL  CG4    4     0.000    72.000;CCCN
+    5  SN0    1  MOL  CG5    5     0.000    45.000;c1ccoc1
+
+[bonds]
+    2  3    1     0.255    1250.0
+    3  4    1     0.400    1250.0
+    4  5    1     0.318    1250.0
+
+#ifdef min
+    1  5    1     0.192 5000000.0
+
+#else
+[constraints]
+    1  5    1     0.192
+#endif
+
+[angles]
+    1  5  4    2   106.995      25.0
+    2  3  4    2    97.500      25.0
+    3  4  5    2    98.035      25.0

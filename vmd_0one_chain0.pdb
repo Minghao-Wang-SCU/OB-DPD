@@ -1,0 +1,17 @@
+REMARK    Custom PDB file with user-defined atom types
+HETATM    1 ATOM MO0 A   1      -0.678   2.580  -0.539  1.00  0.00 #1
+HETATM    2 ATOM MO0 A   2      -0.294  -2.282  -0.217  1.00  0.00 #2
+HETATM    3 ATOM MO0 A   3       0.448  -4.528  -0.015  1.00  0.00 #3
+HETATM    4 ATOM MO0 A   4      -0.249  -0.021   0.317  1.00  0.00 #4
+HETATM    5 ATOM MO0 A   5       1.024   1.074  -0.917  1.00  0.00 #4
+CONECT    1    4
+CONECT    1    5
+CONECT    2    3
+CONECT    2    4
+CONECT    3    2
+CONECT    4    1
+CONECT    4    2
+CONECT    4    5
+CONECT    5    1
+CONECT    5    4
+END
