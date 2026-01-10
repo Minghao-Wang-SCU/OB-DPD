@@ -27,7 +27,7 @@ mkdir -p envs/dpd
 tar -xzf OB-DPD_env.tar.gz -C envs/dpd
 ```
 
-````bash
+```bash
 # 3. Activate the environment
 source envs/dpd/bin/activate
 ```
