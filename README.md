@@ -50,45 +50,33 @@ Line 4 (PEG Flag): Whether the structure contains PEG (1 or 0).
 
 Example A: SMILES Mode
 
-Plaintext
+```text
 
 smiles
-
 CCO(CH2CH2O)10H
-
 50
-
 1
+```
 
 Example B: MOL File Mode
 
-Plaintext
-
+```Plaintext
 mol
-
 ./inputs/drug_molecule.mol
-
 100
-
 0
 
 Example B: SMILES Mode
 
-Plaintext
-
+```text
 smiles
-
 CCO(CH2CH2O)10H
-
 50
-
 1
-
 CCCCCO(CH2CH2O)10H
-
 50
-
 0
+```
 
 ## 2. Run the Script
 Once the input file is ready, execute the main program:
