@@ -39,18 +39,18 @@ Configure input_data.txt
 
 The input file requires strictly 4 lines of parameters:
 
-Line 1 (Mode): Specify the input mode (smiles or mol).
+**Line 1 (Mode)**: Specify the input mode (smiles or mol).
 
-Line 2 (Structure): Provide the SMILES string or the path to the .mol file.
+**Line 2 (Structure)**: Provide the SMILES string or the path to the .mol file.
 
-Line 3 (Count): Number of molecules to simulate.
+**Line 3 (Count)**: Number of molecules to simulate.
 
-Line 4 (PEG Flag): Whether the structure contains PEG (1 or 0).
+**Line 4 (PEG Flag)**: Whether the structure contains PEG (1 or 0).
 
 
 Example A: SMILES Mode
 
-```text
+```textc
 
 smiles
 CCO(CH2CH2O)10H
@@ -60,13 +60,14 @@ CCO(CH2CH2O)10H
 
 Example B: MOL File Mode
 
-```Plaintext
+```text
 mol
 ./inputs/drug_molecule.mol
 100
 0
+```
 
-Example B: SMILES Mode
+Example C: Multi-SMILES Mode
 
 ```text
 smiles
