@@ -35,7 +35,8 @@ source envs/dpd/bin/activate
 ## 🚀 Usage
 To run the simulation, you need to configure the input_data.txt file and run the main script.
 
-1. Configure input_data.txt
+Configure input_data.txt
+
 The input file requires strictly 4 lines of parameters:
 
 Line 1 (Mode): Specify the input mode (smiles or mol).
@@ -48,30 +49,45 @@ Line 4 (PEG Flag): Whether the structure contains PEG (1 or 0).
 
 
 Example A: SMILES Mode
+
 Plaintext
 
 smiles
+
 CCO(CH2CH2O)10H
+
 50
+
 1
 
 Example B: MOL File Mode
+
 Plaintext
 
 mol
+
 ./inputs/drug_molecule.mol
+
 100
+
 0
 
 Example B: SMILES Mode
+
 Plaintext
 
 smiles
+
 CCO(CH2CH2O)10H
+
 50
+
 1
+
 CCCCCO(CH2CH2O)10H
+
 50
+
 0
 
 ## 2. Run the Script
@@ -84,5 +100,5 @@ python main.py --input_data input_data.txt
 Once the input file is ready, execute the main program. If you wish to customize the initial molecular packing, provide the Packmol input file as an argument:
 
 ```bash
-Once the input file is ready, execute the main program. If you wish to customize the initial molecular packing, provide the Packmol input file as an argument:
+python main.py --input_data input_data.txt --packmol_in packmol.inp
 ```
