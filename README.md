@@ -2,7 +2,19 @@
 
 **OB-DPD** (One-Button DPD) is an automated framework designed to streamline Dissipative Particle Dynamics simulations, from coarse-grained mapping to property prediction.
 
-## 📦 Installation
+## 🛠️ Prerequisites
+
+Before installing and running OB-DPD, please ensure you have the following prepared:
+
+1. **External Software:**
+   * **Packmol:** Required for generating the initial molecular packing configurations. 
+   * **LAMMPS:** Required for executing the Dissipative Particle Dynamics simulations. 
+   *(Please ensure both are properly installed and accessible in your system's PATH.)*
+
+2. **Python Dependencies:**
+   * All required Python packages are listed in the `requirements.txt` file. 
+   * ⚠️ **Important:** Please pay special attention to the exact versions of `rdkit`, `numpy`, `pandas`, `shap`, `seaborn`, `matplotlib`, `numba`, and `scipy`. Strict adherence to these versions is highly recommended to avoid compatibility issues during ML predictions and data processing.
+## 📦 Installation 
 
 You can set up the environment using one of the following two methods:
 
