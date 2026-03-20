@@ -12,7 +12,7 @@ Before installing and running OB-DPD, please ensure you have the following prepa
    *(Please ensure both are properly installed and accessible in your system's PATH.)*
 
 2. **Python Dependencies:**
-   * All required Python packages are listed in the `requirements.txt` file. 
+   * All required Python packages are listed in the `OB-DPD.yml` file. 
    * ⚠️ **Important:** Please pay special attention to the exact versions of `rdkit`, `numpy`, `pandas`, `shap`, `seaborn`, `matplotlib`, `numba`, and `scipy`. Strict adherence to these versions is highly recommended to avoid compatibility issues during ML predictions and data processing.
 ## 📦 Installation 
 
