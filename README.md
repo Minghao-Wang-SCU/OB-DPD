@@ -7,8 +7,8 @@
 Before installing and running OB-DPD, please ensure you have the following prepared:
 
 1. **External Software:**
-   * **Packmol:** Required for generating the initial molecular packing configurations. 
-   * **LAMMPS:** Required for executing the Dissipative Particle Dynamics simulations. 
+   * **Packmol:** Required for generating the initial molecular packing configurations. *(Recommended version: 21.1.4)*
+   * **LAMMPS:** Required for executing the Dissipative Particle Dynamics simulations. *(Recommended version: LAMMPS 29 Aug 2024 - Update 2)*
    *(Please ensure both are properly installed and accessible in your system's PATH.)*
 
 2. **Python Dependencies:**
