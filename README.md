@@ -103,3 +103,37 @@ Once the input file is ready, execute the main program. If you wish to customize
 ```bash
 python main.py --input_data input_data.txt --packmol_in packmol.inp
 ```
+
+### Parameterization Modes
+
+Choose the parameterization route with `--param_method`. The default
+`solubility` mode uses the existing ML-predicted solubility parameter workflow:
+
+```bash
+python main.py --input_data input_data.txt --param_method solubility
+```
+
+The `logp` mode uses a separate Anderson-style bead mapper instead of the
+solubility-parameter coarse graining. It keeps the input molecular structure
+unchanged, groups atoms into the supported logP bead palette, and then reads
+pair parameters from `pdf/logp/machine_readable_interactions.cvs`.
+
+```bash
+python main.py --input_data input_data.txt --param_method logp
+```
+
+Supported logP bead types are `H2O`, `CH3`, `CH2`, `CH2CH2`, `CH2OH`,
+`CH2NH2`, `CH2OCH2`, `CH3OCH2`, and `aCHCH`. The logP mode is intentionally
+strict: functional groups not represented by this table are not considered,
+including amides, esters, ketones, aldehydes, nitriles, halogenated groups,
+nitro groups, heteroaromatic rings, tertiary amines, and quaternary ammonium
+groups.
+
+This path does not call the ML solubility-parameter predictor and does not use
+solubility fallback values. Unsupported bead types or bead pairs stop the
+workflow and are reported through `bead_type_assignment.csv` and
+`a_ij_source.csv`. The atom-to-logP-bead grouping is written to files such as
+`0logp_article_mapping0.csv`.
+
+Use `logp_partition.py` separately for water/octanol partition sampling and
+research calibration of selected `A_ij` values.

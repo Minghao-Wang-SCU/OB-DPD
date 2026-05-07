@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 from mapping import get_cg
 from Pred_Solubility_Parameter import Pred_Solubility_Parameter
+from logp_param import create_logp_aij_list, map_smiles_to_logp_article_beads
 import subprocess
 import re
 import argparse
@@ -427,8 +428,42 @@ def get_split_smiles(smiles,n,split_Mw):
 def get_one_chain_and_smiles(smiles, compoents_id=1, split_id=1, tune_model='0', is_opt='0', cg_method='smiles', is_peg=0):
     if cg_method == 'smiles':
         return get_one_chain_and_smiles_original(smiles, compoents_id, split_id, tune_model, is_opt, is_peg)
+    elif cg_method == 'logp_article':
+        return get_one_chain_and_smiles_logp_article(smiles, compoents_id, split_id, is_peg)
     elif cg_method == 'structure':
         return [], []
+
+def get_one_chain_and_smiles_logp_article(smiles, compoents_id=1, split_id=1, is_peg=0):
+    print('-'*20+'调用logP article bead mapping'+'-'*20)
+    mapping_result = map_smiles_to_logp_article_beads(smiles, is_peg=is_peg)
+    bead_types = mapping_result["bead_types"]
+    bead_type_list_drop = []
+    for bead_type in bead_types:
+        if bead_type not in bead_type_list_drop:
+            bead_type_list_drop.append(bead_type)
+
+    bead_type_dir = {bead_type: i + 1 for i, bead_type in enumerate(bead_type_list_drop)}
+    create_one_chain_pdb(
+        mapping_result["adjacency"],
+        mapping_result["coords"],
+        bead_types,
+        bead_type_dir,
+        output_file=f'{compoents_id}one_chain{split_id}.pdb',
+    )
+
+    rows = []
+    for bead_idx, (bead_type, atoms) in enumerate(
+        zip(bead_types, mapping_result["bead_atom_groups"]), start=1
+    ):
+        rows.append(
+            {
+                "bead_id": bead_idx,
+                "bead_type": bead_type,
+                "atom_indices": " ".join(str(atom_idx) for atom_idx in atoms),
+            }
+        )
+    pd.DataFrame(rows).to_csv(f'{compoents_id}logp_article_mapping{split_id}.csv', index=False)
+    return bead_type_list_drop, bead_types
 
 def get_one_chain_and_smiles_original(smiles, compoents_id=1, split_id=1, tune_model='0', is_opt='0', is_peg=0):
     atom_id_list = []
@@ -623,7 +658,8 @@ def generate_lammps_data(atoms, bonds, angles, types, box_size, output_file):
         f.write(f"{num_atoms} atoms\n")
         f.write(f"{num_bonds} bonds\n")
         f.write(f"{num_atom_types+1} atom types\n")
-        f.write(f"1 bond types\n")
+        if num_bonds > 0:
+            f.write(f"1 bond types\n")
         f.write(f"{xlo:.4f} {xhi:.4f} xlo xhi\n")
         f.write(f"{ylo:.4f} {yhi:.4f} ylo yhi\n")
         f.write(f"{zlo:.4f} {zhi:.4f} zlo zhi\n\n")
@@ -640,9 +676,10 @@ def generate_lammps_data(atoms, bonds, angles, types, box_size, output_file):
                 atype = 1
             f.write(f"{i+1} {1} {atype} {x/10:.4f} {y/10:.4f} {z/10:.4f}\n")
 
-        f.write("\nBonds\n\n")
-        for i, (a1, a2) in enumerate(bonds):
-            f.write(f"{i+1} 1 {a1} {a2}\n")
+        if num_bonds > 0:
+            f.write("\nBonds\n\n")
+            for i, (a1, a2) in enumerate(bonds):
+                f.write(f"{i+1} 1 {a1} {a2}\n")
 
 def flory_huggins_parameter(sigma1,sigma2):
     V = 129
@@ -664,8 +701,9 @@ def create_a_ij_list(Pred_Solubility_Parameter):
                 a_ij.append((i+1, j+1, 25.0))
     return a_ij
 
-def create_lammps_in(Pred_Solubility_Parameter,box_size,solution_number):
-    a_ij_list = create_a_ij_list(Pred_Solubility_Parameter)
+def create_lammps_in(Pred_Solubility_Parameter,box_size,solution_number,a_ij_list=None,has_bonds=True,run_steps=3000000):
+    if a_ij_list is None:
+        a_ij_list = create_a_ij_list(Pred_Solubility_Parameter)
     sigma = 1.0
     
     if isinstance(box_size,list) :
@@ -694,9 +732,14 @@ variable        damp equal ${{T}}/10
 
 neighbor        0.5 bin
 neigh_modify    every 1 delay 0
-
+"""
+    if has_bonds:
+        content_head += """
 bond_style      harmonic
 bond_coeff      1  100  0.5
+"""
+
+    content_head += f"""
 
 region box block {xlo} {xhi}0 {ylo} {yhi}0 {zlo} {zhi}0
 create_atoms {len(Pred_Solubility_Parameter)} random  {solution_number} 12121 box
@@ -717,7 +760,7 @@ thermo_modify   lost ignore flush yes lost/bond ignore
 dump            1 all custom 5000 dump.lammpstrj id type x y z
 
 # 运行模拟
-run             3000000
+run             {int(run_steps)}
 """
     with open('lammps.in', 'w') as f:
         f.write(content_head)
@@ -798,7 +841,17 @@ def create_parser():
     parser.add_argument("--T", type=int, default=0)
     parser.add_argument("--input_data", type=str, default='')
     parser.add_argument("--functional_group", type=str, default='')
+    parser.add_argument("--param_method", choices=["solubility", "logp"], default="solubility")
+    parser.add_argument(
+        "--logp_missing",
+        choices=["error"],
+        default="error",
+        help="logp mode is strict: unsupported bead pairs stop the workflow",
+    )
+    parser.add_argument("--logp_table", type=str, default="pdf/logp/machine_readable_interactions.cvs")
+    parser.add_argument("--lammps_steps", type=int, default=3000000)
     return parser.parse_args()
+
 
 # --- 主逻辑 ---
 
@@ -858,7 +911,7 @@ for compoents_id in range(compoents_number):
                 split_smiles_list[split_id],
                 compoents_id=compoents_id,
                 split_id=split_id,
-                cg_method='smiles',
+                cg_method='logp_article' if args.param_method == "logp" else 'smiles',
                 is_peg=current_peg
             )
             all_cg_smiles_list_drop_tmp.append(cg_drop)
@@ -888,7 +941,6 @@ for i in range(len(smiles_list)):
 solution_number = get_box_volum(box_size)*3 - all_atom_number
 if solution_number < 0: solution_number = 0
 
-Pred_Solubility_Parameter_Val = Pred_Solubility_Parameter(all_cg_smiles_list_drop, is_peg_list=all_is_peg_list)
 print('fix start ')
 fix_pdb_files([f'{i}one_chain.pdb' for i in range(compoents_number)])
 print('fix over ')
@@ -896,19 +948,62 @@ print('create_packmol_in start ')
 create_packmol_in(pack_model=0, box_size=box_size, number_list=number_list, packmol_in=packmol_in)
 print('create_packmol_in over ')
 
+bead_smiles_for_params = all_cg_smiles_list_drop + ["HOH"]
+is_peg_for_params = all_is_peg_list + [0]
+parameter_values = None
+parameter_report = {}
+
+if args.param_method == "logp":
+    a_ij_list, logp_assignments, _ = create_logp_aij_list(
+        bead_smiles=bead_smiles_for_params,
+        solubility_values=None,
+        table_path=args.logp_table,
+        missing="error",
+        is_peg_list=is_peg_for_params,
+    )
+    parameter_values = np.full(len(bead_smiles_for_params), 25.0)
+    parameter_report = {
+        "mode": "logp",
+        "assigned_type": [row["assigned_type"] for row in logp_assignments],
+        "assignment_status": [row["status"] for row in logp_assignments],
+        "assignment_reason": [row["reason"] for row in logp_assignments],
+    }
+else:
+    solubility_values = Pred_Solubility_Parameter(all_cg_smiles_list_drop, is_peg_list=all_is_peg_list)
+    sol_sp = max(solubility_values) if len(solubility_values)>0 else 25.0
+    parameter_values = np.append(solubility_values, sol_sp)
+    a_ij_list = create_a_ij_list(parameter_values)
+    parameter_report = {
+        "mode": "solubility",
+        "Pred_Solubility_Parameter": parameter_values,
+    }
+
+has_bonds = True
 if os.path.exists('packed_polymer_and_solution.pdb'):
     atoms, bonds, angles = read_pdb('packed_polymer_and_solution.pdb')
-    generate_lammps_data(atoms, bonds, angles, Pred_Solubility_Parameter_Val, box_size, 'packed_polymer_and_solution.data')
+    has_bonds = len(bonds) > 0
+    generate_lammps_data(atoms, bonds, angles, parameter_values, box_size, 'packed_polymer_and_solution.data')
 
-sol_sp = max(Pred_Solubility_Parameter_Val) if len(Pred_Solubility_Parameter_Val)>0 else 25.0
-Pred_Solubility_Parameter_Val = np.append(Pred_Solubility_Parameter_Val, sol_sp)
+create_lammps_in(
+    parameter_values,
+    box_size,
+    solution_number,
+    a_ij_list=a_ij_list,
+    has_bonds=has_bonds,
+    run_steps=args.lammps_steps,
+)
 
-create_lammps_in(Pred_Solubility_Parameter_Val, box_size, solution_number)
-
-smi_df =pd.DataFrame({'all_cg_smiles_list_drop':all_cg_smiles_list_drop+['HOH'],
-                      'Pred_Solubility_Parameter':Pred_Solubility_Parameter_Val,
-                      'compoents_id':all_type_list+[all_type_list[-1]+1],
-                      'type_id':[i for i in range(1,len(Pred_Solubility_Parameter_Val)+1)]}) 
+smi_df_data = {
+                      'all_cg_smiles_list_drop': bead_smiles_for_params,
+                      'compoents_id': all_type_list + [all_type_list[-1] + 1 if all_type_list else 1],
+                      'type_id':[i for i in range(1,len(parameter_values)+1)],
+                      'param_method': [args.param_method] * len(parameter_values),
+}
+for key, value in parameter_report.items():
+    if key == "mode":
+        continue
+    smi_df_data[key] = value
+smi_df = pd.DataFrame(smi_df_data)
 smi_df.to_excel('smiles_SP.xlsx',index=False)
 
 print('get_a_ij start ')

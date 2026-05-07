@@ -1,0 +1,42 @@
+{
+  "bead_solubility": {
+    "H2O": 47.9,
+    "CH3": 14.5,
+    "CH2CH2": 16.0,
+    "CH2OH": 29.0,
+    "aCHCH": 18.5
+  },
+  "fixed_overrides": {
+    "H2O:H2O": 25.0,
+    "CH3:CH3": 25.8,
+    "CH2CH2:CH2CH2": 25.8,
+    "CH2OH:CH2OH": 25.8,
+    "aCHCH:aCHCH": 25.8,
+    "CH3:H2O": 80.0,
+    "CH2CH2:H2O": 80.0
+  },
+  "stages": [
+    {
+      "name": "article_small_ethanol",
+      "optimize_pairs": [
+        "CH2OH:H2O"
+      ],
+      "max_iter": 4,
+      "box": [20, 20, 60],
+      "density": 3.0,
+      "water_density": 3.0,
+      "octanol_density": 3.25,
+      "solute_bead_fraction": 0.05,
+      "steps": 200000,
+      "dump_every": 2000,
+      "targets": [
+        {
+          "name": "ethanol",
+          "solute": "ethanol",
+          "target_logp": -0.31,
+          "solute_init": "split"
+        }
+      ]
+    }
+  ]
+}

@@ -60,4 +60,10 @@ log.lammps
 .DS_Store
 
 outputs/
-
+validation_runs/
+article/
+codex_worker_space/
+pdf/*.pdf
+pdf/*.docx
+a_ij_source.csv
+bead_type_assignment.csv
