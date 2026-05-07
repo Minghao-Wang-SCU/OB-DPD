@@ -548,6 +548,7 @@ def get_one_chain_and_smiles_original(smiles, compoents_id=1, split_id=1, tune_m
 
 def create_packmol_in(pack_model=0,box_size=30,number_list=[],packmol_in=''):
     if len(packmol_in) < 1 :
+        packmol_box_size = box_size * 10
         content = f"""tolerance 1
 nloop 100
 output packed_polymer_and_solution.pdb
@@ -559,7 +560,7 @@ filetype pdb
         f"""
 structure {i}one_chain.pdb
 number {number_list[i]}
-inside box 0. 0. 0. {box_size}0 {box_size}0 {box_size}0
+inside box 0. 0. 0. {packmol_box_size} {packmol_box_size} {packmol_box_size}
 end structure
 """
 )
@@ -639,10 +640,11 @@ def read_pdb(pdb_file):
 
     return atoms, bonds, angles
 
-def generate_lammps_data(atoms, bonds, angles, types, box_size, output_file):
+def generate_lammps_data(atoms, bonds, angles, types, box_size, output_file, type_charges=None, charge_enabled=False, coord_scale=0.1):
     num_atoms = len(atoms)
     num_bonds = len(bonds)
     num_atom_types = len(types) if len(types) > 0 else 1
+    type_charges = type_charges or [0.0] * num_atom_types
     
     if isinstance(box_size,list) :
         xlo, xhi = 0, box_size[0]
@@ -657,7 +659,7 @@ def generate_lammps_data(atoms, bonds, angles, types, box_size, output_file):
         f.write("#LAMMPS Data File\n\n")
         f.write(f"{num_atoms} atoms\n")
         f.write(f"{num_bonds} bonds\n")
-        f.write(f"{num_atom_types+1} atom types\n")
+        f.write(f"{num_atom_types} atom types\n")
         if num_bonds > 0:
             f.write(f"1 bond types\n")
         f.write(f"{xlo:.4f} {xhi:.4f} xlo xhi\n")
@@ -674,7 +676,11 @@ def generate_lammps_data(atoms, bonds, angles, types, box_size, output_file):
                 atype = int(element)
             except:
                 atype = 1
-            f.write(f"{i+1} {1} {atype} {x/10:.4f} {y/10:.4f} {z/10:.4f}\n")
+            if charge_enabled:
+                charge = type_charges[atype - 1] if 0 < atype <= len(type_charges) else 0.0
+                f.write(f"{i+1} {1} {atype} {charge:.12e} {x*coord_scale:.4f} {y*coord_scale:.4f} {z*coord_scale:.4f}\n")
+            else:
+                f.write(f"{i+1} {1} {atype} {x*coord_scale:.4f} {y*coord_scale:.4f} {z*coord_scale:.4f}\n")
 
         if num_bonds > 0:
             f.write("\nBonds\n\n")
@@ -701,9 +707,149 @@ def create_a_ij_list(Pred_Solubility_Parameter):
                 a_ij.append((i+1, j+1, 25.0))
     return a_ij
 
-def create_lammps_in(Pred_Solubility_Parameter,box_size,solution_number,a_ij_list=None,has_bonds=True,run_steps=3000000):
+ION_BEAD_SMILES = {"Na+", "Cl-", "[Na+]", "[Cl-]"}
+
+def is_ion_bead(smiles):
+    return smiles in ION_BEAD_SMILES
+
+def create_solubility_aij_with_ions(parameter_values, bead_smiles):
+    a_ij = create_a_ij_list(parameter_values)
+    water_idx = None
+    for idx, smiles in enumerate(bead_smiles):
+        if smiles in {"HOH", "H2O", "O"}:
+            water_idx = idx
+            break
+    if water_idx is None:
+        return a_ij
+
+    aij_map = {(i - 1, j - 1): val for i, j, val in a_ij}
+    for i, smiles_i in enumerate(bead_smiles):
+        for j in range(i, len(bead_smiles)):
+            smiles_j = bead_smiles[j]
+            if not (is_ion_bead(smiles_i) or is_ion_bead(smiles_j)):
+                continue
+            if is_ion_bead(smiles_i) and is_ion_bead(smiles_j):
+                val = 25.0
+            else:
+                other = j if is_ion_bead(smiles_i) else i
+                val = aij_map.get((min(water_idx, other), max(water_idx, other)), 25.0)
+            aij_map[(i, j)] = val
+
+    return [(i + 1, j + 1, aij_map[(i, j)]) for i in range(len(bead_smiles)) for j in range(i, len(bead_smiles))]
+
+def infer_bead_charge(smiles):
+    if smiles in {"HOH", "H2O", "O"}:
+        return 0.0, "matched", "water"
+    if smiles in {"Na+", "[Na+]"}:
+        return 1.0, "matched", "sodium counterion"
+    if smiles in {"Cl-", "[Cl-]"}:
+        return -1.0, "matched", "chloride counterion"
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return 0.0, "invalid_smiles", "RDKit could not parse charge; assigned 0"
+    charge = float(sum(atom.GetFormalCharge() for atom in mol.GetAtoms()))
+    return charge, "matched", "formal charge from bead SMILES"
+
+def create_charge_assignments(bead_smiles, output_file="charge_assignment.csv"):
+    rows = []
+    charges = []
+    for type_id, smiles in enumerate(bead_smiles, start=1):
+        charge, status, reason = infer_bead_charge(smiles)
+        charges.append(charge)
+        rows.append({
+            "type_id": type_id,
+            "bead_smiles": smiles,
+            "charge": charge,
+            "status": status,
+            "reason": reason,
+        })
+    pd.DataFrame(rows).to_csv(output_file, index=False)
+    return charges, rows
+
+def write_charge_summary(
+    atoms,
+    type_charges,
+    solution_number,
+    solution_type_id=None,
+    extra_counts=None,
+    output_file="charge_summary.csv",
+):
+    extra_counts = extra_counts or {}
+    solution_type_id = solution_type_id or len(type_charges)
+    type_counts = Counter()
+    for atom in atoms:
+        try:
+            atype = int(atom[6])
+        except Exception:
+            atype = 1
+        type_counts[atype] += 1
+    if type_charges:
+        type_counts[int(solution_type_id)] += int(solution_number)
+    for type_id, count in extra_counts.items():
+        type_counts[int(type_id)] += int(count)
+
+    rows = []
+    total_charge = 0.0
+    for type_id, charge in enumerate(type_charges, start=1):
+        count = type_counts.get(type_id, 0)
+        subtotal = count * charge
+        total_charge += subtotal
+        rows.append({
+            "type_id": type_id,
+            "count": count,
+            "charge": charge,
+            "subtotal_charge": subtotal,
+        })
+    rows.append({
+        "type_id": "total",
+        "count": sum(type_counts.values()),
+        "charge": "",
+        "subtotal_charge": total_charge,
+    })
+    pd.DataFrame(rows).to_csv(output_file, index=False)
+    return total_charge
+
+def solute_net_charge(atoms, type_charges):
+    total_charge = 0.0
+    for atom in atoms:
+        try:
+            atype = int(atom[6])
+        except Exception:
+            atype = 1
+        if 0 < atype <= len(type_charges):
+            total_charge += type_charges[atype - 1]
+    return total_charge
+
+def counterions_for_charge(net_charge):
+    rounded = int(round(net_charge))
+    if abs(net_charge - rounded) > 1.0e-6:
+        raise ValueError(f"net charge must be close to an integer to add counterions, got {net_charge}")
+    if rounded > 0:
+        return {"Cl-": rounded}
+    if rounded < 0:
+        return {"Na+": -rounded}
+    return {}
+
+def create_lammps_in(
+    Pred_Solubility_Parameter,
+    box_size,
+    solution_number,
+    a_ij_list=None,
+    has_bonds=True,
+    run_steps=3000000,
+    charge_enabled=False,
+    type_charges=None,
+    charge_lambda=0.25,
+    coul_cutoff=3.0,
+    kspace_accuracy=1.0e-4,
+    solution_type_id=None,
+    extra_create_counts=None,
+):
     if a_ij_list is None:
         a_ij_list = create_a_ij_list(Pred_Solubility_Parameter)
+    type_charges = type_charges or [0.0] * len(Pred_Solubility_Parameter)
+    solution_type_id = solution_type_id or len(Pred_Solubility_Parameter)
+    extra_create_counts = extra_create_counts or {}
     sigma = 1.0
     
     if isinstance(box_size,list) :
@@ -717,18 +863,17 @@ def create_lammps_in(Pred_Solubility_Parameter,box_size,solution_number,a_ij_lis
         
     content_head = f"""# LAMMPS Input
 dimension    3
-units        si
+units        lj
 boundary    p p p
-atom_style   molecular
+atom_style   {'full' if charge_enabled else 'molecular'}
 read_data    packed_polymer_and_solution.data
 neigh_modify one 4000
 
 mass * 1.0
-variable        kb equal 1.3806488e-23
-variable        T equal 1/${{kb}}
+variable        T equal 1.0
 variable        cutoff equal 1.0
-variable        sigma equal 4.5
-variable        damp equal ${{T}}/10
+variable        sigma equal 1.0
+variable        damp equal 0.1
 
 neighbor        0.5 bin
 neigh_modify    every 1 delay 0
@@ -741,15 +886,24 @@ bond_coeff      1  100  0.5
 
     content_head += f"""
 
-region box block {xlo} {xhi}0 {ylo} {yhi}0 {zlo} {zhi}0
-create_atoms {len(Pred_Solubility_Parameter)} random  {solution_number} 12121 box
+region box block {xlo} {xhi} {ylo} {yhi} {zlo} {zhi}
+create_atoms {int(solution_type_id)} random  {solution_number} 12121 box
+"""
+    for type_id, count in extra_create_counts.items():
+        if int(count) > 0:
+            content_head += f"create_atoms {int(type_id)} random  {int(count)} {12121 + int(type_id)} box\n"
 
+    content_head += f"""
 comm_modify vel yes
 
-pair_style	dpd ${{T}} ${{cutoff}} 92894
+pair_style	{'dpd/coul/slater/long ${T} ${cutoff} 92894 ' + str(charge_lambda) + ' ' + str(coul_cutoff) if charge_enabled else 'dpd ${T} ${cutoff} 92894'}
 pair_coeff   * * 25.00  ${{sigma}}
 """
-    
+    if charge_enabled:
+        content_head += f"kspace_style  pppm {kspace_accuracy:.1e}\n"
+        for type_id, charge in enumerate(type_charges, start=1):
+            content_head += f"set type {type_id} charge {charge:.12e}\n"
+
     content_tail = f"""
 fix             1 all nve
 timestep        0.02
@@ -757,7 +911,7 @@ thermo          5000
 thermo_modify   lost ignore flush yes lost/bond ignore
 
 # 输出设置
-dump            1 all custom 5000 dump.lammpstrj id type x y z
+dump            1 all custom 5000 dump.lammpstrj id type {'q ' if charge_enabled else ''}x y z
 
 # 运行模拟
 run             {int(run_steps)}
@@ -766,7 +920,13 @@ run             {int(run_steps)}
         f.write(content_head)
         for t in a_ij_list:
             i,j,val = t
-            f.write(f'pair_coeff   {i} {j} {val:.2f}  ${{sigma}}\n')
+            charged = (
+                charge_enabled
+                and abs(type_charges[i - 1]) > 0.0
+                and abs(type_charges[j - 1]) > 0.0
+            )
+            charged_flag = " yes" if charged else ""
+            f.write(f'pair_coeff   {i} {j} {val:.2f}  ${{sigma}}{charged_flag}\n')
         f.write(content_tail)
 
 def fix_pdb_files(pdb_name_list):
@@ -850,6 +1010,21 @@ def create_parser():
     )
     parser.add_argument("--logp_table", type=str, default="pdf/logp/machine_readable_interactions.cvs")
     parser.add_argument("--lammps_steps", type=int, default=3000000)
+    parser.add_argument(
+        "--charge_method",
+        choices=["auto", "none", "explicit"],
+        default="auto",
+        help="solubility mode charge handling: auto enables explicit electrostatics only when formal charges are found",
+    )
+    parser.add_argument("--charge_lambda", type=float, default=0.25)
+    parser.add_argument("--coul_cutoff", type=float, default=3.0)
+    parser.add_argument("--kspace_accuracy", type=float, default=1.0e-4)
+    parser.add_argument(
+        "--charge_unit_scale",
+        type=float,
+        default=1.0,
+        help="multiplier from formal charge to LAMMPS reduced charge units",
+    )
     return parser.parse_args()
 
 
@@ -950,8 +1125,15 @@ print('create_packmol_in over ')
 
 bead_smiles_for_params = all_cg_smiles_list_drop + ["HOH"]
 is_peg_for_params = all_is_peg_list + [0]
+solution_type_id = len(bead_smiles_for_params)
 parameter_values = None
 parameter_report = {}
+type_charges = [0.0] * len(bead_smiles_for_params)
+charge_report = []
+charge_enabled = False
+counterion_counts = {}
+extra_create_counts = {}
+lammps_type_charges = type_charges
 
 if args.param_method == "logp":
     a_ij_list, logp_assignments, _ = create_logp_aij_list(
@@ -972,17 +1154,82 @@ else:
     solubility_values = Pred_Solubility_Parameter(all_cg_smiles_list_drop, is_peg_list=all_is_peg_list)
     sol_sp = max(solubility_values) if len(solubility_values)>0 else 25.0
     parameter_values = np.append(solubility_values, sol_sp)
-    a_ij_list = create_a_ij_list(parameter_values)
+    type_charges, charge_report = create_charge_assignments(bead_smiles_for_params)
+    has_nonzero_charge = any(abs(charge) > 1.0e-12 for charge in type_charges)
+    charge_enabled = args.charge_method == "explicit" or (
+        args.charge_method == "auto" and has_nonzero_charge
+    )
+    a_ij_list = create_solubility_aij_with_ions(parameter_values, bead_smiles_for_params)
     parameter_report = {
         "mode": "solubility",
         "Pred_Solubility_Parameter": parameter_values,
+        "charge": type_charges,
+        "charge_status": [row["status"] for row in charge_report],
+        "charge_reason": [row["reason"] for row in charge_report],
+        "charge_method": [args.charge_method] * len(parameter_values),
+        "charge_enabled": [charge_enabled] * len(parameter_values),
     }
 
 has_bonds = True
 if os.path.exists('packed_polymer_and_solution.pdb'):
     atoms, bonds, angles = read_pdb('packed_polymer_and_solution.pdb')
     has_bonds = len(bonds) > 0
-    generate_lammps_data(atoms, bonds, angles, parameter_values, box_size, 'packed_polymer_and_solution.data')
+    if args.param_method == "solubility" and charge_enabled:
+        net_charge = solute_net_charge(atoms, type_charges)
+        counterion_counts = counterions_for_charge(net_charge)
+        for ion_smiles, count in counterion_counts.items():
+            if count <= 0:
+                continue
+            if ion_smiles not in bead_smiles_for_params:
+                bead_smiles_for_params.append(ion_smiles)
+                parameter_values = np.append(parameter_values, sol_sp)
+                charge, status, reason = infer_bead_charge(ion_smiles)
+                type_charges.append(charge)
+                charge_report.append({
+                    "type_id": len(type_charges),
+                    "bead_smiles": ion_smiles,
+                    "charge": charge,
+                    "status": status,
+                    "reason": reason,
+                })
+            ion_type_id = bead_smiles_for_params.index(ion_smiles) + 1
+            extra_create_counts[ion_type_id] = extra_create_counts.get(ion_type_id, 0) + count
+        if counterion_counts:
+            create_charge_assignments(bead_smiles_for_params)
+        a_ij_list = create_solubility_aij_with_ions(parameter_values, bead_smiles_for_params)
+        total_charge = write_charge_summary(
+            atoms,
+            type_charges,
+            solution_number,
+            solution_type_id=solution_type_id,
+            extra_counts=extra_create_counts,
+        )
+        if abs(total_charge) > 1.0e-8:
+            print(
+                "Warning: explicit-charge DPD system is not charge neutral; "
+                f"net charge = {total_charge:.6f}. Add counterions or use --charge_method none."
+            )
+        lammps_type_charges = [charge * args.charge_unit_scale for charge in type_charges]
+        parameter_report = {
+            "mode": "solubility",
+            "Pred_Solubility_Parameter": parameter_values,
+            "charge": type_charges,
+            "charge_status": [row["status"] for row in charge_report],
+            "charge_reason": [row["reason"] for row in charge_report],
+            "charge_method": [args.charge_method] * len(parameter_values),
+            "charge_enabled": [charge_enabled] * len(parameter_values),
+            "counterion_count": [extra_create_counts.get(type_id, 0) for type_id in range(1, len(parameter_values) + 1)],
+        }
+    generate_lammps_data(
+        atoms,
+        bonds,
+        angles,
+        parameter_values,
+        box_size,
+        'packed_polymer_and_solution.data',
+        type_charges=lammps_type_charges,
+        charge_enabled=charge_enabled,
+    )
 
 create_lammps_in(
     parameter_values,
@@ -991,11 +1238,21 @@ create_lammps_in(
     a_ij_list=a_ij_list,
     has_bonds=has_bonds,
     run_steps=args.lammps_steps,
+    charge_enabled=charge_enabled,
+    type_charges=lammps_type_charges,
+    charge_lambda=args.charge_lambda,
+    coul_cutoff=args.coul_cutoff,
+    kspace_accuracy=args.kspace_accuracy,
+    solution_type_id=solution_type_id,
+    extra_create_counts=extra_create_counts,
 )
 
+component_ids_for_params = all_type_list + [all_type_list[-1] + 1 if all_type_list else 1]
+while len(component_ids_for_params) < len(parameter_values):
+    component_ids_for_params.append(component_ids_for_params[-1] + 1 if component_ids_for_params else 1)
 smi_df_data = {
                       'all_cg_smiles_list_drop': bead_smiles_for_params,
-                      'compoents_id': all_type_list + [all_type_list[-1] + 1 if all_type_list else 1],
+                      'compoents_id': component_ids_for_params,
                       'type_id':[i for i in range(1,len(parameter_values)+1)],
                       'param_method': [args.param_method] * len(parameter_values),
 }

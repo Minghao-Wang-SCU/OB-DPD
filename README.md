@@ -137,3 +137,33 @@ workflow and are reported through `bead_type_assignment.csv` and
 
 Use `logp_partition.py` separately for water/octanol partition sampling and
 research calibration of selected `A_ij` values.
+
+In `solubility` mode, bead charges are assigned automatically from the RDKit
+formal charge of each bead SMILES. With the default `--charge_method auto`, the
+workflow keeps the original neutral DPD input when all charges are zero. If any
+nonzero bead charge is found, it writes `atom_style full`, uses explicit bead
+charges, and switches the LAMMPS pair style to `dpd/coul/slater/long` with PPPM
+long-range electrostatics. LAMMPS input is written in reduced `units lj`: `T =
+1.0`, `sigma = 1.0`, and formal charges are used directly as reduced charges by
+default.
+
+Charged solubility-mode systems are neutralized automatically with `Na+` or
+`Cl-` counterions after packing the solute molecules. Positive solute charge
+adds `Cl-`; negative solute charge adds `Na+`. Counterions are added directly in
+the LAMMPS input with `create_atoms` and are not passed through the ML
+solubility-parameter predictor.
+
+Ion `A_ij` values are assigned conservatively: ion-ion and ion-water pairs use
+`25.0`, while ion-organic-bead pairs copy the corresponding water-organic-bead
+`A_ij`. The assigned charges are written to `charge_assignment.csv`,
+`charge_summary.csv` reports type counts and net system charge, and
+`smiles_SP.xlsx` records the counterion count.
+
+Packmol still writes PDB coordinates in its working coordinate scale
+(`--box_size * 10`). During data generation, coordinates are scaled by `0.1` so
+`packed_polymer_and_solution.data` and `lammps.in` both use the reduced LJ box
+set by `--box_size`.
+
+```bash
+python main.py --input_data input_data.txt --param_method solubility --charge_method auto
+```
