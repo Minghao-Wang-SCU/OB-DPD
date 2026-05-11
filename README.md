@@ -12,14 +12,38 @@ Before installing and running OB-DPD, please ensure you have the following prepa
    *(Please ensure both are properly installed and accessible in your system's PATH.)*
 
 2. **Python Dependencies:**
-   * All required Python packages are listed in the `OB-DPD.yml` file. 
+   * The portable Conda environment is defined in `environment.yml`.
+   * `OB-DPD.yml` is retained as a full development-environment snapshot.
    * ⚠️ **Important:** Please pay special attention to the exact versions of `rdkit`, `numpy`, `pandas`, `shap`, `seaborn`, `matplotlib`, `numba`, and `scipy`. Strict adherence to these versions is highly recommended to avoid compatibility issues during ML predictions and data processing.
 ## 📦 Installation 
 
 You can set up the environment using one of the following two methods:
 
 ### Method 1: Using Conda Configuration (Recommended)
-If you have internet access, use the provided YAML file to create the environment:
+If Packmol, MPI, and LAMMPS are already installed on your system, use the
+portable Conda file to install only the Python dependencies:
+
+```bash
+conda env create -f environment.yml
+conda activate dpd
+```
+
+Verify that the external executables are available:
+
+```bash
+packmol < /dev/null
+mpirun --version
+lmp_mpi -h
+```
+
+If your LAMMPS executable has a different name or path, pass it explicitly:
+
+```bash
+python main.py --input_data input_data.txt --lammps_bin /path/to/lmp
+```
+
+For an exact snapshot of the original development environment, you may use
+`OB-DPD.yml` instead:
 
 ```bash
 conda env create -f OB-DPD.yml
@@ -153,11 +177,18 @@ adds `Cl-`; negative solute charge adds `Na+`. Counterions are added directly in
 the LAMMPS input with `create_atoms` and are not passed through the ML
 solubility-parameter predictor.
 
+After solutes are packed and counterions are assigned, the workflow fills the box
+with water beads so that the final total bead count is exactly
+`box_size^3 * 3`. One water bead represents one water molecule. The generated
+`lammps.in` reads packed solutes first, creates counterions, and creates water
+last. `system_bead_summary.csv` records the target total, solute beads,
+counterion beads, water beads, and actual bead density.
+
 Ion `A_ij` values are assigned conservatively: ion-ion and ion-water pairs use
 `25.0`, while ion-organic-bead pairs copy the corresponding water-organic-bead
 `A_ij`. The assigned charges are written to `charge_assignment.csv`,
 `charge_summary.csv` reports type counts and net system charge, and
-`smiles_SP.xlsx` records the counterion count.
+`smiles_SP.xlsx` records the counterion and water counts.
 
 Packmol still writes PDB coordinates in its working coordinate scale
 (`--box_size * 10`). During data generation, coordinates are scaled by `0.1` so
@@ -166,4 +197,12 @@ set by `--box_size`.
 
 ```bash
 python main.py --input_data input_data.txt --param_method solubility --charge_method auto
+```
+
+To use a custom LAMMPS executable, pass `--lammps_bin` or set `LAMMPS_BIN`.
+For the locally rebuilt CUDA executable with `dpd/coul/slater/long/gpu` support:
+
+```bash
+python main.py --input_data input_data.txt --param_method solubility --job 1 \
+  --lammps_bin /home/ls/lammps/lammps-29Aug2024-obdpd-gpu/build/lmp
 ```
