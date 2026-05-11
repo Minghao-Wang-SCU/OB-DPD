@@ -809,6 +809,28 @@ def write_charge_summary(
     pd.DataFrame(rows).to_csv(output_file, index=False)
     return total_charge
 
+def write_system_bead_summary(
+    box_size,
+    target_total_beads,
+    solute_bead_count,
+    counterion_bead_count,
+    water_bead_count,
+    output_file="system_bead_summary.csv",
+):
+    total_beads = solute_bead_count + counterion_bead_count + water_bead_count
+    box_volume = get_box_volum(box_size)
+    rows = [
+        {"item": "box_volume", "value": box_volume},
+        {"item": "target_total_beads", "value": target_total_beads},
+        {"item": "solute_bead_count", "value": solute_bead_count},
+        {"item": "counterion_bead_count", "value": counterion_bead_count},
+        {"item": "water_bead_count", "value": water_bead_count},
+        {"item": "total_bead_count", "value": total_beads},
+        {"item": "target_bead_density", "value": 3.0},
+        {"item": "actual_bead_density", "value": total_beads / box_volume if box_volume else 0.0},
+    ]
+    pd.DataFrame(rows).to_csv(output_file, index=False)
+
 def solute_net_charge(atoms, type_charges):
     total_charge = 0.0
     for atom in atoms:
@@ -887,11 +909,11 @@ bond_coeff      1  100  0.5
     content_head += f"""
 
 region box block {xlo} {xhi} {ylo} {yhi} {zlo} {zhi}
-create_atoms {int(solution_type_id)} random  {solution_number} 12121 box
 """
     for type_id, count in extra_create_counts.items():
         if int(count) > 0:
             content_head += f"create_atoms {int(type_id)} random  {int(count)} {12121 + int(type_id)} box\n"
+    content_head += f"create_atoms {int(solution_type_id)} random  {int(solution_number)} 12121 box\n"
 
     content_head += f"""
 comm_modify vel yes
@@ -1025,6 +1047,11 @@ def create_parser():
         default=1.0,
         help="multiplier from formal charge to LAMMPS reduced charge units",
     )
+    parser.add_argument(
+        "--lammps_bin",
+        default=os.environ.get("LAMMPS_BIN", "lmp_mpi"),
+        help="LAMMPS executable used for the final run; can also be set with LAMMPS_BIN",
+    )
     return parser.parse_args()
 
 
@@ -1109,13 +1136,6 @@ all_cg_smiles_list_drop = []
 for l in all_cg_smiles_list_drop_tmp:
     for s in l: all_cg_smiles_list_drop.append(s)
 
-all_atom_number = 0
-for i in range(len(smiles_list)):
-    all_atom_number += 100 * int(number_list[i]) # Approx
-
-solution_number = get_box_volum(box_size)*3 - all_atom_number
-if solution_number < 0: solution_number = 0
-
 print('fix start ')
 fix_pdb_files([f'{i}one_chain.pdb' for i in range(compoents_number)])
 print('fix over ')
@@ -1134,6 +1154,10 @@ charge_enabled = False
 counterion_counts = {}
 extra_create_counts = {}
 lammps_type_charges = type_charges
+target_total_beads = int(round(get_box_volum(box_size) * 3))
+solute_bead_count = 0
+counterion_bead_count = 0
+solution_number = 0
 
 if args.param_method == "logp":
     a_ij_list, logp_assignments, _ = create_logp_aij_list(
@@ -1173,6 +1197,9 @@ else:
 has_bonds = True
 if os.path.exists('packed_polymer_and_solution.pdb'):
     atoms, bonds, angles = read_pdb('packed_polymer_and_solution.pdb')
+    if not atoms:
+        raise ValueError("packed_polymer_and_solution.pdb contains no solute beads.")
+    solute_bead_count = len(atoms)
     has_bonds = len(bonds) > 0
     if args.param_method == "solubility" and charge_enabled:
         net_charge = solute_net_charge(atoms, type_charges)
@@ -1197,6 +1224,22 @@ if os.path.exists('packed_polymer_and_solution.pdb'):
         if counterion_counts:
             create_charge_assignments(bead_smiles_for_params)
         a_ij_list = create_solubility_aij_with_ions(parameter_values, bead_smiles_for_params)
+    counterion_bead_count = sum(int(count) for count in extra_create_counts.values())
+    solution_number = target_total_beads - solute_bead_count - counterion_bead_count
+    if solution_number < 0:
+        raise ValueError(
+            "solute beads plus counterions exceed the target DPD density: "
+            f"target={target_total_beads}, solute={solute_bead_count}, "
+            f"counterions={counterion_bead_count}"
+        )
+    write_system_bead_summary(
+        box_size,
+        target_total_beads,
+        solute_bead_count,
+        counterion_bead_count,
+        solution_number,
+    )
+    if args.param_method == "solubility" and charge_enabled:
         total_charge = write_charge_summary(
             atoms,
             type_charges,
@@ -1220,6 +1263,12 @@ if os.path.exists('packed_polymer_and_solution.pdb'):
             "charge_enabled": [charge_enabled] * len(parameter_values),
             "counterion_count": [extra_create_counts.get(type_id, 0) for type_id in range(1, len(parameter_values) + 1)],
         }
+    parameter_report.update({
+        "target_total_beads": [target_total_beads] * len(parameter_values),
+        "solute_bead_count": [solute_bead_count] * len(parameter_values),
+        "counterion_bead_count": [counterion_bead_count] * len(parameter_values),
+        "water_bead_count": [solution_number] * len(parameter_values),
+    })
     generate_lammps_data(
         atoms,
         bonds,
@@ -1230,6 +1279,8 @@ if os.path.exists('packed_polymer_and_solution.pdb'):
         type_charges=lammps_type_charges,
         charge_enabled=charge_enabled,
     )
+else:
+    raise FileNotFoundError("Packmol did not generate packed_polymer_and_solution.pdb")
 
 create_lammps_in(
     parameter_values,
@@ -1268,6 +1319,6 @@ get_a_ij()
 print('get_a_ij over ')
 print(f'Total time: {time.time()-time_start}s')
 try:
-    subprocess.run(["mpirun", "-np", str(args.job), "lmp_mpi", "-sf","gpu","-pk","gpu","1","-i", "lammps.in"])
+    subprocess.run(["mpirun", "-np", str(args.job), args.lammps_bin, "-sf","gpu","-pk","gpu","1","-i", "lammps.in"])
 except:
     pass

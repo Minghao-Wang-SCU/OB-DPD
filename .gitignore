@@ -67,3 +67,6 @@ pdf/*.pdf
 pdf/*.docx
 a_ij_source.csv
 bead_type_assignment.csv
+charge_assignment.csv
+charge_summary.csv
+system_bead_summary.csv
