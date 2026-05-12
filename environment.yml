@@ -16,6 +16,8 @@ dependencies:
   - seaborn=0.13.2
   - shap=0.46.0=cpu_*
   - numba=0.61.0
+  - optuna=4.2.1
+  - statsmodels=0.14.4
   - mdanalysis=2.6.1
   - biopython=1.81
   - openpyxl=3.1.5

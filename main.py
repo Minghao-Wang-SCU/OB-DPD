@@ -1021,7 +1021,7 @@ def create_parser():
     parser.add_argument("--packmol_in", type=str, default='')
     parser.add_argument("--job", type=int, default=8)
     parser.add_argument("--T", type=int, default=0)
-    parser.add_argument("--input_data", type=str, default='')
+    parser.add_argument("--input", "--input_data", dest="input_data", type=str, default='')
     parser.add_argument("--functional_group", type=str, default='')
     parser.add_argument("--param_method", choices=["solubility", "logp"], default="solubility")
     parser.add_argument(

@@ -19,6 +19,8 @@ REQUIRED_IMPORTS = [
     ("seaborn", "seaborn"),
     ("shap", "shap"),
     ("numba", "numba"),
+    ("optuna", "optuna"),
+    ("statsmodels", "statsmodels"),
     ("MDAnalysis", "MDAnalysis"),
     ("Bio", "biopython"),
     ("openpyxl", "openpyxl"),
