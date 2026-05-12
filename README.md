@@ -21,11 +21,33 @@ You can set up the environment using one of the following two methods:
 
 ### Method 1: Using Conda Configuration (Recommended)
 If Packmol, MPI, and LAMMPS are already installed on your system, use the
-portable Conda file to install only the Python dependencies:
+automated installer to create the Conda environment and register the local
+`auto_mapping/` source paths:
+
+```bash
+bash scripts/install_env.sh --lammps-bin lmp_mpi
+conda activate dpd
+```
+
+The installer reads `environment.yml`, creates or updates the `dpd`
+environment, and installs Conda activation hooks for:
+
+```text
+OB_DPD_HOME
+OB_DPD_AUTO_MAPPING
+OB_DPD_AUTO_MAPPING_M3
+PYTHONPATH
+```
+
+It also runs a dependency check for RDKit, NumPy/SciPy, XGBoost, the local
+`auto_mapping/` scripts, Packmol, MPI, and LAMMPS.
+
+Manual installation is also supported:
 
 ```bash
 conda env create -f environment.yml
 conda activate dpd
+python scripts/check_install.py --lammps-bin lmp_mpi
 ```
 
 Verify that the external executables are available:
