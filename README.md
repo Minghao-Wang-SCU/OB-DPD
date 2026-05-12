@@ -42,6 +42,11 @@ If your LAMMPS executable has a different name or path, pass it explicitly:
 python main.py --input_data input_data.txt --lammps_bin /path/to/lmp
 ```
 
+The Martini-style mapping scripts under `auto_mapping/` are included in this
+repository and are used as local source files. They are not installed from PyPI.
+The portable `environment.yml` therefore installs only their Python
+dependencies, such as RDKit, NumPy, SciPy, and requests.
+
 For an exact snapshot of the original development environment, you may use
 `OB-DPD.yml` instead:
 

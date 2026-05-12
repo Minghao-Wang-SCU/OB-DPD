@@ -2,9 +2,13 @@ from rdkit import Chem
 from rdkit.Chem import AllChem,rdmolops 
 from rdkit.Chem import Draw
 from tqdm import tqdm
-import auto_martini as am
 from smiles2split import create_mol_atom_dir
 import random
+
+try:
+    import auto_martini as am
+except ImportError:
+    am = None
 
 def mol2pdb(mol,name):
     # 添加氢原子
@@ -135,6 +139,13 @@ def generate_cg_pdb(splited_atom_dir,smiles,split_id):
     """
     从SMILES生成粗粒化后的分子并保存为SMILES文件
     """
+    if am is None:
+        raise ImportError(
+            "The legacy cg.py workflow requires the optional 'auto_martini' "
+            "package, which is not part of the portable OB-DPD environment. "
+            "Use the default mapping.py/cg_param_m3.py workflow or install "
+            "auto_martini separately if you need this legacy path."
+        )
     
     mol = Chem.MolFromSmiles(smiles)
     # 添加氢原子并嵌入分子构型

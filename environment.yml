@@ -23,5 +23,3 @@ dependencies:
   - requests=2.32.5
   - tqdm=4.67.1
   - ipykernel
-  - pip:
-      - auto-martini==0.2.1
