@@ -12,10 +12,13 @@ import numpy as np
 import pandas as pd
 from mapping import get_cg
 from Pred_Solubility_Parameter import Pred_Solubility_Parameter
-from logp_param import create_logp_aij_list, map_smiles_to_logp_article_beads
+from logp_param import create_logp_aij_list, map_smiles_to_logp_article_beads, parse_logp_pair_overrides
 import subprocess
 import re
 import argparse
+import shlex
+import shutil
+import sys
 import matplotlib
 matplotlib.use('Agg') 
 import matplotlib.pyplot as plt
@@ -27,6 +30,12 @@ from itertools import product
 from collections import defaultdict, Counter
 
 # --- 辅助函数定义 ---
+
+def default_lammps_executable():
+    env_value = os.environ.get("LAMMPS_BIN")
+    if env_value:
+        return env_value
+    return shutil.which("lmp_mpi") or shutil.which("lmp") or "lmp_mpi"
 
 def get_a_ij():
     # 设置全局字体大小和字体类型
@@ -638,13 +647,67 @@ def read_pdb(pdb_file):
                 except Exception:
                     pass # Skip malformed lines
 
+    neighbors = defaultdict(set)
+    for a1, a2 in bonds:
+        neighbors[a1].add(a2)
+        neighbors[a2].add(a1)
+    for center, connected in neighbors.items():
+        connected = sorted(connected)
+        for idx_i in range(len(connected)):
+            for idx_j in range(idx_i + 1, len(connected)):
+                angles.append((connected[idx_i], center, connected[idx_j]))
+
     return atoms, bonds, angles
 
-def generate_lammps_data(atoms, bonds, angles, types, box_size, output_file, type_charges=None, charge_enabled=False, coord_scale=0.1):
+def generate_lammps_data(
+    atoms,
+    bonds,
+    angles,
+    types,
+    box_size,
+    output_file,
+    type_charges=None,
+    charge_enabled=False,
+    coord_scale=0.1,
+    bond_r0_by_pair=None,
+    write_angles=False,
+):
     num_atoms = len(atoms)
     num_bonds = len(bonds)
+    num_angles = len(angles) if write_angles else 0
     num_atom_types = len(types) if len(types) > 0 else 1
     type_charges = type_charges or [0.0] * num_atom_types
+    bond_r0_by_pair = bond_r0_by_pair or {}
+
+    atom_type_by_id = {}
+    for atom in atoms:
+        atom_id, _, _, _, _, _, element = atom
+        try:
+            atom_type_by_id[int(atom_id)] = int(element)
+        except Exception:
+            atom_type_by_id[int(atom_id)] = 1
+
+    bond_type_by_pair = {}
+    bond_coeffs = {}
+    next_bond_type = 1
+    typed_bonds = []
+    for a1, a2 in bonds:
+        t1 = atom_type_by_id.get(a1, 1)
+        t2 = atom_type_by_id.get(a2, 1)
+        key = tuple(sorted((t1, t2)))
+        if key not in bond_type_by_pair:
+            bond_type_by_pair[key] = next_bond_type
+            bond_coeffs[next_bond_type] = {
+                "type_pair": key,
+                "k": 150.0 if key in bond_r0_by_pair else 100.0,
+                "r0": float(bond_r0_by_pair.get(key, 0.5)),
+            }
+            next_bond_type += 1
+        typed_bonds.append((bond_type_by_pair[key], a1, a2))
+
+    angle_coeffs = {}
+    if num_angles > 0:
+        angle_coeffs[1] = {"k": 5.0, "theta0": 180.0}
     
     if isinstance(box_size,list) :
         xlo, xhi = 0, box_size[0]
@@ -659,9 +722,13 @@ def generate_lammps_data(atoms, bonds, angles, types, box_size, output_file, typ
         f.write("#LAMMPS Data File\n\n")
         f.write(f"{num_atoms} atoms\n")
         f.write(f"{num_bonds} bonds\n")
+        if num_angles > 0:
+            f.write(f"{num_angles} angles\n")
         f.write(f"{num_atom_types} atom types\n")
         if num_bonds > 0:
-            f.write(f"1 bond types\n")
+            f.write(f"{len(bond_coeffs)} bond types\n")
+        if num_angles > 0:
+            f.write(f"{len(angle_coeffs)} angle types\n")
         f.write(f"{xlo:.4f} {xhi:.4f} xlo xhi\n")
         f.write(f"{ylo:.4f} {yhi:.4f} ylo yhi\n")
         f.write(f"{zlo:.4f} {zhi:.4f} zlo zhi\n\n")
@@ -684,8 +751,15 @@ def generate_lammps_data(atoms, bonds, angles, types, box_size, output_file, typ
 
         if num_bonds > 0:
             f.write("\nBonds\n\n")
-            for i, (a1, a2) in enumerate(bonds):
-                f.write(f"{i+1} 1 {a1} {a2}\n")
+            for i, (bond_type, a1, a2) in enumerate(typed_bonds):
+                f.write(f"{i+1} {bond_type} {a1} {a2}\n")
+
+        if num_angles > 0:
+            f.write("\nAngles\n\n")
+            for i, (a1, a2, a3) in enumerate(angles):
+                f.write(f"{i+1} 1 {a1} {a2} {a3}\n")
+
+    return {"bond_coeffs": bond_coeffs, "angle_coeffs": angle_coeffs}
 
 def flory_huggins_parameter(sigma1,sigma2):
     V = 129
@@ -852,12 +926,143 @@ def counterions_for_charge(net_charge):
         return {"Na+": -rounded}
     return {}
 
+def flatten_logp_recipe(all_cg_smiles_list_list):
+    recipe = []
+    for bead_list in all_cg_smiles_list_list:
+        recipe.extend(bead_list)
+    return recipe
+
+def write_logp_fit_protocol(
+    missing_rows,
+    recipe_types,
+    smiles_list,
+    args,
+    output_script="run_missing_logp_fit.sh",
+):
+    if not missing_rows:
+        return None, None
+    fit_pairs = sorted(
+        {
+            tuple(sorted((str(row["type_i"]), str(row["type_j"]))))
+            for row in missing_rows
+        }
+    )
+    if not recipe_types:
+        raise ValueError("cannot create logP fit protocol without a solute bead recipe")
+
+    target_smiles = args.logp_fit_target_smiles
+    if not target_smiles:
+        if len(smiles_list) != 1:
+            raise ValueError(
+                "missing logP parameters for a multi-component system; "
+                "provide --logp_fit_target_smiles for the fitted solute."
+            )
+        target_smiles = smiles_list[0]
+
+    outdir = os.path.abspath(args.logp_fit_outdir)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    cmd = [
+        sys.executable,
+        os.path.join(script_dir, "logp_partition.py"),
+        "fit",
+        "--solute",
+        ",".join(recipe_types),
+        "--allow-custom-beads",
+        "--target-smiles",
+        target_smiles,
+        "--fit-pairs",
+        ",".join(f"{a}:{b}" for a, b in fit_pairs),
+        "--outdir",
+        outdir,
+        "--table",
+        args.logp_table,
+        "--steps",
+        str(args.logp_fit_steps),
+        "--dump-every",
+        str(args.logp_fit_dump_every),
+        "--max-iter",
+        str(args.logp_fit_max_iter),
+        "--optimizer",
+        args.logp_fit_optimizer,
+        "--job",
+        str(args.logp_fit_job if args.logp_fit_job > 0 else args.job),
+        "--lammps",
+        args.lammps_bin,
+    ]
+    if args.logp_fit_optimizer == "bayesian":
+        cmd.extend(["--bo-initial", str(args.logp_bo_initial)])
+        cmd.extend(["--bo-grid-step", str(args.logp_bo_grid_step)])
+        cmd.extend(["--bo-acq-candidates", str(args.logp_bo_acq_candidates)])
+        cmd.extend(["--bo-epsilon", str(args.logp_bo_epsilon)])
+        cmd.extend(["--bo-noise", str(args.logp_bo_noise)])
+        cmd.extend(["--bo-gp-restarts", str(args.logp_bo_gp_restarts)])
+        cmd.extend(["--bo-grid-chunk-size", str(args.logp_bo_grid_chunk_size)])
+        if not args.logp_bo_full_grid_ei:
+            cmd.append("--no-bo-full-grid-ei")
+        cmd.extend(["--failure-penalty-loss", str(args.logp_failure_penalty_loss)])
+        if not args.logp_penalize_failures:
+            cmd.append("--no-penalize-failures")
+        for value in args.logp_bo_grid:
+            cmd.extend(["--bo-grid", value])
+    if args.logp_fit_article_protocol:
+        cmd.append("--article-protocol")
+    if args.logp_angle_param_mode:
+        cmd.extend(["--angle-param-mode", args.logp_angle_param_mode])
+    if args.logp_fit_organic_solvent:
+        cmd.extend(["--organic-solvent", args.logp_fit_organic_solvent])
+    if args.logp_fit_ensemble:
+        cmd.extend(["--ensemble", args.logp_fit_ensemble])
+        cmd.extend(["--pressure", str(args.logp_fit_pressure)])
+        cmd.extend(["--pressure-damp", str(args.logp_fit_pressure_damp)])
+    cmd.extend(["--charge-method", args.charge_method])
+    cmd.extend(["--charge-lambda", str(args.charge_lambda)])
+    cmd.extend(["--coul-cutoff", str(args.coul_cutoff)])
+    cmd.extend(["--kspace-accuracy", str(args.kspace_accuracy)])
+    cmd.extend(["--charge-unit-scale", str(args.charge_unit_scale)])
+    for value in args.logp_bead_charge:
+        cmd.extend(["--bead-charge", value])
+    cmd.extend(["--heavy-atom-correction", args.logp_heavy_atom_correction])
+    cmd.extend(["--heavy-radius-scale", str(args.logp_heavy_radius_scale)])
+    cmd.extend(["--bonded-r0-factor", str(args.logp_bonded_r0_factor)])
+    for value in args.logp_bead_heavy_atoms:
+        cmd.extend(["--bead-heavy-atoms", value])
+    if args.logp_fit_gpu:
+        cmd.append("--gpu")
+    for value in args.logp_manual_aij:
+        cmd.extend(["--override", value])
+    for value in args.logp_fit_target_logp_value:
+        cmd.extend(["--target-logp-value", value])
+    for value in args.logp_fit_bead_solubility:
+        cmd.extend(["--bead-solubility", value])
+
+    with open(output_script, "w", encoding="utf-8") as handle:
+        handle.write("#!/usr/bin/env bash\nset -euo pipefail\n")
+        handle.write("cd " + shlex.quote(os.getcwd()) + "\n")
+        handle.write(" ".join(shlex.quote(part) for part in cmd) + "\n")
+    os.chmod(output_script, 0o755)
+
+    pd.DataFrame(
+        [
+            {
+                "type_i": a,
+                "type_j": b,
+                "fit_pair": f"{a}:{b}",
+                "fit_command_script": output_script,
+                "fit_outdir": outdir,
+            }
+            for a, b in fit_pairs
+        ]
+    ).to_csv("logp_fit_required_pairs.csv", index=False)
+    return cmd, outdir
+
 def create_lammps_in(
     Pred_Solubility_Parameter,
     box_size,
     solution_number,
     a_ij_list=None,
+    pair_cutoff_list=None,
     has_bonds=True,
+    topology_coeffs=None,
     run_steps=3000000,
     charge_enabled=False,
     type_charges=None,
@@ -866,13 +1071,29 @@ def create_lammps_in(
     kspace_accuracy=1.0e-4,
     solution_type_id=None,
     extra_create_counts=None,
+    dpd_gamma=1.0,
+    timestep=0.02,
+    thermo_interval=5000,
+    dump_interval=5000,
+    ensemble="nve",
+    target_pressure=23.7,
+    pressure_damp=10.0,
 ):
     if a_ij_list is None:
         a_ij_list = create_a_ij_list(Pred_Solubility_Parameter)
     type_charges = type_charges or [0.0] * len(Pred_Solubility_Parameter)
     solution_type_id = solution_type_id or len(Pred_Solubility_Parameter)
     extra_create_counts = extra_create_counts or {}
-    sigma = 1.0
+    pair_cutoff_map = {}
+    for item in pair_cutoff_list or []:
+        i, j, cutoff = item
+        if cutoff is None or pd.isna(cutoff):
+            continue
+        pair_cutoff_map[(int(i), int(j))] = float(cutoff)
+    global_cutoff = max(pair_cutoff_map.values(), default=1.0)
+    topology_coeffs = topology_coeffs or {}
+    bond_coeffs = topology_coeffs.get("bond_coeffs", {})
+    angle_coeffs = topology_coeffs.get("angle_coeffs", {})
     
     if isinstance(box_size,list) :
         xlo, xhi = 0, box_size[0]
@@ -893,8 +1114,8 @@ neigh_modify one 4000
 
 mass * 1.0
 variable        T equal 1.0
-variable        cutoff equal 1.0
-variable        sigma equal 1.0
+variable        cutoff equal {global_cutoff:.4f}
+variable        gamma equal {float(dpd_gamma):.4f}
 variable        damp equal 0.1
 
 neighbor        0.5 bin
@@ -903,8 +1124,18 @@ neigh_modify    every 1 delay 0
     if has_bonds:
         content_head += """
 bond_style      harmonic
-bond_coeff      1  100  0.5
 """
+        if bond_coeffs:
+            for bond_type in sorted(bond_coeffs):
+                coeff = bond_coeffs[bond_type]
+                content_head += f"bond_coeff      {bond_type}  {coeff['k']:.6g}  {coeff['r0']:.6g}\n"
+        else:
+            content_head += "bond_coeff      1  100  0.5\n"
+    if angle_coeffs:
+        content_head += "\nangle_style     harmonic\n"
+        for angle_type in sorted(angle_coeffs):
+            coeff = angle_coeffs[angle_type]
+            content_head += f"angle_coeff     {angle_type}  {coeff['k']:.6g}  {coeff['theta0']:.6g}\n"
 
     content_head += f"""
 
@@ -919,21 +1150,27 @@ region box block {xlo} {xhi} {ylo} {yhi} {zlo} {zhi}
 comm_modify vel yes
 
 pair_style	{'dpd/coul/slater/long ${T} ${cutoff} 92894 ' + str(charge_lambda) + ' ' + str(coul_cutoff) if charge_enabled else 'dpd ${T} ${cutoff} 92894'}
-pair_coeff   * * 25.00  ${{sigma}}
 """
     if charge_enabled:
+        content_head += "pair_coeff   * * 25.00  ${gamma}\n"
         content_head += f"kspace_style  pppm {kspace_accuracy:.1e}\n"
         for type_id, charge in enumerate(type_charges, start=1):
             content_head += f"set type {type_id} charge {charge:.12e}\n"
 
+    if ensemble == "nph":
+        fix_line = f"fix             1 all nph iso {target_pressure:.6g} {target_pressure:.6g} {pressure_damp:.6g}"
+    else:
+        fix_line = "fix             1 all nve"
+
     content_tail = f"""
-fix             1 all nve
-timestep        0.02
-thermo          5000
+velocity        all create ${{T}} 4928459 dist gaussian
+{fix_line}
+timestep        {float(timestep):.6g}
+thermo          {int(thermo_interval)}
 thermo_modify   lost ignore flush yes lost/bond ignore
 
 # 输出设置
-dump            1 all custom 5000 dump.lammpstrj id type {'q ' if charge_enabled else ''}x y z
+dump            1 all custom {int(dump_interval)} dump.lammpstrj id type {'q ' if charge_enabled else ''}x y z
 
 # 运行模拟
 run             {int(run_steps)}
@@ -948,7 +1185,11 @@ run             {int(run_steps)}
                 and abs(type_charges[j - 1]) > 0.0
             )
             charged_flag = " yes" if charged else ""
-            f.write(f'pair_coeff   {i} {j} {val:.2f}  ${{sigma}}{charged_flag}\n')
+            if charge_enabled:
+                f.write(f'pair_coeff   {i} {j} {val:.2f}  ${{gamma}}{charged_flag}\n')
+            else:
+                cutoff = pair_cutoff_map.get((i, j), pair_cutoff_map.get((j, i), global_cutoff))
+                f.write(f'pair_coeff   {i} {j} {val:.2f}  ${{gamma}}  {cutoff:.4f}\n')
         f.write(content_tail)
 
 def fix_pdb_files(pdb_name_list):
@@ -1017,7 +1258,7 @@ def import_from_file(file_path):
 def create_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--smiles", type=str)
-    parser.add_argument("--box_size", type=int, default=30)
+    parser.add_argument("--box_size", type=float, default=30)
     parser.add_argument("--packmol_in", type=str, default='')
     parser.add_argument("--job", type=int, default=8)
     parser.add_argument("--T", type=int, default=0)
@@ -1026,12 +1267,68 @@ def create_parser():
     parser.add_argument("--param_method", choices=["solubility", "logp"], default="solubility")
     parser.add_argument(
         "--logp_missing",
-        choices=["error"],
-        default="error",
-        help="logp mode is strict: unsupported bead pairs stop the workflow",
+        choices=["error", "manual", "optimize", "fallback"],
+        default="optimize",
+        help=(
+            "handling for logP bead pairs absent from the table: optimize uses an "
+            "optimizer; manual uses interactive per-iteration Aij input"
+        ),
     )
+    parser.add_argument(
+        "--logp_manual_aij",
+        action="append",
+        default=[],
+        help="initial manual logP Aij as BEAD1:BEAD2=Aij; repeat as needed",
+    )
+    parser.add_argument("--logp_fit_execute", action="store_true", help="execute DPD logP fitting for missing pairs in optimize/manual mode")
+    parser.add_argument("--logp_fit_outdir", default="logp_missing_fit", help="output directory for missing logP fitting")
+    parser.add_argument("--logp_fit_target_smiles", default="", help="target SMILES for missing-parameter logP fitting; defaults to the single input molecule")
+    parser.add_argument("--logp_fit_target_logp_value", action="append", default=[], help="external target logP estimate as METHOD=VALUE")
+    parser.add_argument("--logp_fit_steps", type=int, default=200000)
+    parser.add_argument("--logp_fit_dump_every", type=int, default=2000)
+    parser.add_argument("--logp_fit_max_iter", type=int, default=5)
+    parser.add_argument("--logp_fit_optimizer", choices=["nelder-mead", "coordinate", "manual", "bayesian"], default="nelder-mead")
+    parser.add_argument("--logp_fit_job", type=int, default=0, help="MPI ranks for logP fitting; 0 reuses --job")
+    parser.add_argument("--logp_fit_gpu", action="store_true")
+    parser.add_argument("--logp_fit_bead_solubility", action="append", default=[], help="initial solubility parameter as BEAD=VALUE")
+    parser.add_argument("--logp_bo_initial", type=int, default=10, help="random initial Aij grid samples for Bayesian logP fitting")
+    parser.add_argument("--logp_bo_grid", action="append", default=[], help="Bayesian Aij grid as LOW:HIGH:STEP or BEAD1:BEAD2=LOW:HIGH:STEP")
+    parser.add_argument("--logp_bo_grid_step", type=float, default=1.0, help="default Bayesian Aij grid spacing")
+    parser.add_argument("--logp_bo_acq_candidates", type=int, default=5000, help="candidate grid points scored by expected improvement")
+    parser.add_argument("--logp_bo_epsilon", type=float, default=0.01, help="expected-improvement exploration margin")
+    parser.add_argument("--logp_bo_noise", type=float, default=1e-6, help="Gaussian-process white-noise level")
+    parser.add_argument("--logp_bo_gp_restarts", type=int, default=2, help="Gaussian-process hyperparameter restarts")
+    parser.add_argument("--logp_bo_full_grid_ei", action=argparse.BooleanOptionalAction, default=True, help="scan the full discrete Aij grid for maximum EI")
+    parser.add_argument("--logp_bo_grid_chunk_size", type=int, default=100000, help="candidate chunk size for full-grid EI scans")
+    parser.add_argument("--logp_penalize_failures", action=argparse.BooleanOptionalAction, default=True, help="penalize failed logP fitting simulations instead of aborting")
+    parser.add_argument("--logp_failure_penalty_loss", type=float, default=100.0, help="objective loss assigned to failed single-target logP fitting runs")
+    parser.add_argument("--logp_fit_article_protocol", action="store_true", help="use literature logP fitting defaults: 20x20x60, 4410 water, 2205 organic, 180 solute, 1e6 steps")
+    parser.add_argument(
+        "--logp_angle_param_mode",
+        "--angle-param-mode",
+        dest="logp_angle_param_mode",
+        choices=["article", "geometry", "heuristic", "none"],
+        default="",
+        help="angle mode forwarded to logp_partition.py; article-protocol defaults to article when this is omitted",
+    )
+    parser.add_argument("--logp_fit_organic_solvent", default="", help="organic solvent recipe for logP fitting; default is octanol")
+    parser.add_argument("--logp_fit_ensemble", choices=["nve", "nph"], default="", help="override logP fitting partition ensemble")
+    parser.add_argument("--logp_fit_pressure", type=float, default=23.7, help="reduced pressure for logP fitting with nph")
+    parser.add_argument("--logp_fit_pressure_damp", type=float, default=2.0, help="LAMMPS pressure damping for logP fitting with nph")
+    parser.add_argument("--logp_bead_charge", action="append", default=[], help="charge override for logP fitting as BEAD=CHARGE")
+    parser.add_argument("--logp_bead_heavy_atoms", action="append", default=[], help="heavy atom count for logP bead as BEAD=COUNT")
+    parser.add_argument("--logp_heavy_atom_correction", choices=["none", "missing", "all"], default="missing", help="use heavy atom counts to estimate missing/all Rij and bonded r0 during logP fitting")
+    parser.add_argument("--logp_heavy_radius_scale", type=float, default=1.0, help="scale factor for heavy-atom radius estimates")
+    parser.add_argument("--logp_bonded_r0_factor", type=float, default=0.4, help="bonded r0 factor times Rij when r0 is estimated from heavy atom counts")
     parser.add_argument("--logp_table", type=str, default="pdf/logp/machine_readable_interactions.cvs")
     parser.add_argument("--lammps_steps", type=int, default=3000000)
+    parser.add_argument("--timestep", type=float, default=0.02)
+    parser.add_argument("--dpd_gamma", type=float, default=1.0)
+    parser.add_argument("--dump_interval", type=int, default=5000)
+    parser.add_argument("--thermo_interval", type=int, default=5000)
+    parser.add_argument("--ensemble", choices=["nve", "nph"], default="nve")
+    parser.add_argument("--target_pressure", type=float, default=23.7)
+    parser.add_argument("--pressure_damp", type=float, default=10.0)
     parser.add_argument(
         "--charge_method",
         choices=["auto", "none", "explicit"],
@@ -1049,8 +1346,13 @@ def create_parser():
     )
     parser.add_argument(
         "--lammps_bin",
-        default=os.environ.get("LAMMPS_BIN", "lmp_mpi"),
-        help="LAMMPS executable used for the final run; can also be set with LAMMPS_BIN",
+        default=default_lammps_executable(),
+        help="LAMMPS executable for the final run; defaults to LAMMPS_BIN, then lmp_mpi, then lmp",
+    )
+    parser.add_argument(
+        "--no_run",
+        action="store_true",
+        help="generate all workflow files but skip the final LAMMPS execution",
     )
     return parser.parse_args()
 
@@ -1154,19 +1456,87 @@ charge_enabled = False
 counterion_counts = {}
 extra_create_counts = {}
 lammps_type_charges = type_charges
+pair_cutoff_list = None
+bond_r0_by_pair = {}
 target_total_beads = int(round(get_box_volum(box_size) * 3))
 solute_bead_count = 0
 counterion_bead_count = 0
 solution_number = 0
 
 if args.param_method == "logp":
-    a_ij_list, logp_assignments, _ = create_logp_aij_list(
+    logp_manual_overrides = parse_logp_pair_overrides(args.logp_manual_aij)
+    logp_missing_mode = "optimize" if args.logp_missing == "manual" else args.logp_missing
+    logp_discovery_overrides = {} if args.logp_missing == "manual" else logp_manual_overrides
+    a_ij_list, logp_assignments, logp_pair_rows = create_logp_aij_list(
         bead_smiles=bead_smiles_for_params,
         solubility_values=None,
         table_path=args.logp_table,
-        missing="error",
+        missing=logp_missing_mode,
         is_peg_list=is_peg_for_params,
+        manual_overrides=logp_discovery_overrides,
+        heavy_atom_correction=args.logp_heavy_atom_correction,
+        heavy_radius_scale=args.logp_heavy_radius_scale,
     )
+    missing_fit_rows = [
+        row
+        for row in logp_pair_rows
+        if str(row.get("source", "")).startswith("logp_fit_required")
+    ]
+    if missing_fit_rows:
+        recipe_types = flatten_logp_recipe(all_cg_smiles_list_list)
+        if args.logp_missing == "manual":
+            args.logp_fit_optimizer = "manual"
+        fit_cmd, fit_outdir = write_logp_fit_protocol(
+            missing_fit_rows,
+            recipe_types,
+            smiles_list,
+            args,
+        )
+        if args.logp_fit_execute:
+            print("logP table parameters are missing; running DPD logP fitting.")
+            subprocess.run(fit_cmd, check=True)
+            fitted_table = os.path.join(fit_outdir, "fitted_interactions.csv")
+            if not os.path.exists(fitted_table):
+                raise FileNotFoundError(f"logP fitting finished but did not write {fitted_table}")
+            fitted_keys = {
+                tuple(sorted((str(row["type_i"]), str(row["type_j"]))))
+                for row in missing_fit_rows
+            }
+            post_fit_overrides = {
+                key: value
+                for key, value in logp_manual_overrides.items()
+                if key not in fitted_keys
+            }
+            a_ij_list, logp_assignments, logp_pair_rows = create_logp_aij_list(
+                bead_smiles=bead_smiles_for_params,
+                solubility_values=None,
+                table_path=fitted_table,
+                missing="error",
+                is_peg_list=is_peg_for_params,
+                manual_overrides=post_fit_overrides,
+                heavy_atom_correction=args.logp_heavy_atom_correction,
+                heavy_radius_scale=args.logp_heavy_radius_scale,
+            )
+            args.logp_table = fitted_table
+        else:
+            raise RuntimeError(
+                "logP mode found bead pairs absent from the parameter table. "
+                "I wrote missing_logp_pairs.csv, logp_fit_required_pairs.csv, "
+                "and run_missing_logp_fit.sh. Run that script or rerun with "
+                "--logp_fit_execute, then use the fitted_interactions.csv table. "
+                "For per-iteration manual fitting, use --logp_missing manual; "
+                "optional --logp_manual_aij values are only initial guesses."
+            )
+    pair_cutoff_list = [
+        (row["i"], row["j"], row["r_ij"])
+        for row in logp_pair_rows
+        if not pd.isna(row["r_ij"])
+    ]
+    bond_r0_by_pair = {
+        tuple(sorted((int(row["i"]), int(row["j"])))): float(row["r0"])
+        for row in logp_pair_rows
+        if not pd.isna(row["r0"])
+    }
     parameter_values = np.full(len(bead_smiles_for_params), 25.0)
     parameter_report = {
         "mode": "logp",
@@ -1269,7 +1639,7 @@ if os.path.exists('packed_polymer_and_solution.pdb'):
         "counterion_bead_count": [counterion_bead_count] * len(parameter_values),
         "water_bead_count": [solution_number] * len(parameter_values),
     })
-    generate_lammps_data(
+    topology_coeffs = generate_lammps_data(
         atoms,
         bonds,
         angles,
@@ -1278,6 +1648,8 @@ if os.path.exists('packed_polymer_and_solution.pdb'):
         'packed_polymer_and_solution.data',
         type_charges=lammps_type_charges,
         charge_enabled=charge_enabled,
+        bond_r0_by_pair=bond_r0_by_pair,
+        write_angles=args.param_method == "logp",
     )
 else:
     raise FileNotFoundError("Packmol did not generate packed_polymer_and_solution.pdb")
@@ -1287,7 +1659,9 @@ create_lammps_in(
     box_size,
     solution_number,
     a_ij_list=a_ij_list,
+    pair_cutoff_list=pair_cutoff_list,
     has_bonds=has_bonds,
+    topology_coeffs=topology_coeffs,
     run_steps=args.lammps_steps,
     charge_enabled=charge_enabled,
     type_charges=lammps_type_charges,
@@ -1296,6 +1670,13 @@ create_lammps_in(
     kspace_accuracy=args.kspace_accuracy,
     solution_type_id=solution_type_id,
     extra_create_counts=extra_create_counts,
+    dpd_gamma=args.dpd_gamma,
+    timestep=args.timestep,
+    thermo_interval=args.thermo_interval,
+    dump_interval=args.dump_interval,
+    ensemble=args.ensemble,
+    target_pressure=args.target_pressure,
+    pressure_damp=args.pressure_damp,
 )
 
 component_ids_for_params = all_type_list + [all_type_list[-1] + 1 if all_type_list else 1]
@@ -1318,7 +1699,10 @@ print('get_a_ij start ')
 get_a_ij()
 print('get_a_ij over ')
 print(f'Total time: {time.time()-time_start}s')
-try:
-    subprocess.run(["mpirun", "-np", str(args.job), args.lammps_bin, "-sf","gpu","-pk","gpu","1","-i", "lammps.in"])
-except:
-    pass
+if args.no_run:
+    print("LAMMPS execution skipped because --no_run was set.")
+else:
+    try:
+        subprocess.run(["mpirun", "-np", str(args.job), args.lammps_bin, "-sf","gpu","-pk","gpu","1","-i", "lammps.in"])
+    except:
+        pass

@@ -55,10 +55,11 @@ Verify that the external executables are available:
 ```bash
 packmol < /dev/null
 mpirun --version
-lmp_mpi -h
+lmp_mpi -h  # or: lmp -h
 ```
 
-If your LAMMPS executable has a different name or path, pass it explicitly:
+LAMMPS is resolved in this order: `LAMMPS_BIN`, `lmp_mpi`, then `lmp`. If your
+LAMMPS executable has a different name or path, pass it explicitly:
 
 ```bash
 python main.py --input_data input_data.txt --lammps_bin /path/to/lmp
@@ -180,14 +181,165 @@ including amides, esters, ketones, aldehydes, nitriles, halogenated groups,
 nitro groups, heteroaromatic rings, tertiary amines, and quaternary ammonium
 groups.
 
-This path does not call the ML solubility-parameter predictor and does not use
-solubility fallback values. Unsupported bead types or bead pairs stop the
-workflow and are reported through `bead_type_assignment.csv` and
-`a_ij_source.csv`. The atom-to-logP-bead grouping is written to files such as
-`0logp_article_mapping0.csv`.
+This path does not call the ML solubility-parameter predictor. The atom-to-logP
+bead grouping is written to files such as `0logp_article_mapping0.csv`, and the
+assigned pair sources are written to `bead_type_assignment.csv` and
+`a_ij_source.csv`.
 
-Use `logp_partition.py` separately for water/octanol partition sampling and
-research calibration of selected `A_ij` values.
+When all bead pairs are covered by the literature table or supported
+interpolation rules, the workflow uses those `A_ij` values directly. When a
+pair is missing, `--logp_missing` controls the next step:
+
+```bash
+# Automatic derivative-free fitting of missing Aij values
+python main.py --input_data input_data.txt --param_method logp \
+  --logp_missing optimize --logp_fit_execute
+```
+
+In `optimize` mode, the missing pair starts from a solubility-parameter-based
+initial `A_ij`; `logp_partition.py fit` then runs water/octanol partition DPD
+simulations and updates the selected `A_ij` values with `nelder-mead` or
+`coordinate` optimization. Bayesian optimization is also available and follows
+the literature workflow: random initial sampling on a discrete `A_ij` grid,
+`GaussianProcessRegressor` surrogate fitting, Expected Improvement candidate
+selection, and a logP RMSE objective for multi-target fitting. Failed LAMMPS or
+analysis runs are kept in the history with `observed_logp = +/-10` and a large
+penalty loss by default.
+
+```bash
+python main.py --input_data input_data.txt --param_method logp \
+  --logp_missing optimize --logp_fit_execute \
+  --logp_fit_optimizer bayesian \
+  --logp_bo_initial 10 \
+  --logp_bo_grid 20:60:1 \
+  --logp_fit_max_iter 40
+```
+
+Use pair-specific grids when a pair needs a narrower search range:
+
+```bash
+python main.py --input_data input_data.txt --param_method logp \
+  --logp_missing optimize --logp_fit_execute \
+  --logp_fit_optimizer bayesian \
+  --logp_bo_grid CH3:H2O=20:45:1 \
+  --logp_bo_grid CH2OH:CH2CH2=25:70:2
+```
+
+For a literature-style Bayesian logP fitting run, enable the article protocol.
+This uses LAMMPS with a `20 x 20 x 60` DPD box, 4410 water molecules, 2205
+organic solvent molecules, 180 solute molecules, 1,000,000 steps,
+500,000-step equilibration, `dt = 0.01`, `fix nph iso 23.7 23.7 2.0`, and
+trajectory output every 1000 steps. The DPD pair style supplies the thermostat;
+`fix nph` is the LAMMPS approximation to the article's constant-pressure
+barostat. The analysis switches to the UMMAP-style route: 30 z-slabs, solvent
+and solute concentration profiles, gradient-based interface detection, failure
+penalty for collapsed/mixed phases, and the last 50 post-equilibration frames.
+
+```bash
+python main.py --input_data input_data.txt --param_method logp \
+  --logp_missing optimize --logp_fit_execute \
+  --logp_fit_optimizer bayesian \
+  --logp_fit_article_protocol \
+  --logp_angle_param_mode article \
+  --logp_bo_initial 10 \
+  --logp_bo_grid 20:60:2 \
+  --logp_fit_max_iter 40
+```
+
+Angle parameters for logP partition/fitting runs are controlled by
+`--logp_angle_param_mode` (or the alias `--angle-param-mode`) in `main.py`, and
+by `--angle-param-mode` in `logp_partition.py`. `article` applies the
+literature rules for supported Anderson beads (`105` degrees for alkyl
+backbones and `125` degrees next to `CH2OH`, with the literature force constant
+converted to LAMMPS harmonic units). `geometry` uses template coordinates when
+present and otherwise falls back to `heuristic`. `heuristic` keeps article rules
+where possible and assigns weak fallback angles to aromatic, ionic, polar, or
+unknown bead triplets. `none` disables angle terms entirely. When
+`--logp_fit_article_protocol` is used and no angle mode is specified, the
+fitting script defaults to `article`.
+
+By default, Bayesian optimization evaluates Expected Improvement over the full
+discrete `A_ij` grid in chunks. Disable this only for very large exploratory
+runs:
+
+```bash
+python logp_partition.py fit-staged \
+  --stage-config examples/staged_logp_fit_ethanol.json \
+  --optimizer bayesian \
+  --article-protocol \
+  --bo-grid 20:60:2 \
+  --no-bo-full-grid-ei
+```
+
+For bead types outside the table, logP fitting can estimate missing `R_ij` and
+bonded `r0` from bead heavy atom counts. The default mode only fills missing
+values and does not overwrite literature table values:
+
+```bash
+python logp_partition.py build \
+  --solute X,Y --allow-custom-beads \
+  --bead-heavy-atoms X=8 \
+  --bead-heavy-atoms Y=1 \
+  --default-missing-aij 25 \
+  --heavy-atom-correction missing
+```
+
+The radius estimate uses `R_ij = r_i + r_j` with
+`r_i = 0.5 * heavy_count_i^(1/3)` in reduced units, scaled by
+`--heavy-radius-scale`. Missing bonded lengths use
+`r0 = --bonded-r0-factor * R_ij` with a default factor of `0.4`. Use
+`--heavy-atom-correction all` only when you intentionally want heavy atom counts
+to override table `R_ij/r0` values.
+
+If `--logp_fit_execute` is omitted, the workflow writes
+`missing_logp_pairs.csv`, `logp_fit_required_pairs.csv`, and
+`run_missing_logp_fit.sh`, then stops before production DPD.
+
+```bash
+# Manual per-iteration fitting of missing Aij values
+python main.py --input_data input_data.txt --param_method logp \
+  --logp_missing manual --logp_fit_execute
+```
+
+In `manual` mode, the first iteration also starts from the solubility-based
+initial value unless initial guesses are supplied:
+
+```bash
+python main.py --input_data input_data.txt --param_method logp \
+  --logp_missing manual --logp_fit_execute \
+  --logp_manual_aij CH3:CH2OH=42.5
+```
+
+After each water/octanol simulation, the program prints the target logP,
+observed logP, current error, and current `A_ij`. Enter the next trial values
+as comma-separated numbers, for example `42.5,55.0`, or as explicit pair
+updates such as `CH3:CH2OH=42.5`. Press Enter on a blank line to stop and keep
+the best fitted values so far.
+
+Fitting writes the merged parameter table to
+`logp_missing_fit/fitted_interactions.csv`. The main workflow automatically
+reloads this file after `--logp_fit_execute` and uses it for the final DPD input
+generation. If the fitting script was run separately, pass the fitted table
+explicitly:
+
+```bash
+python main.py --input_data input_data.txt --param_method logp \
+  --logp_table logp_missing_fit/fitted_interactions.csv
+```
+
+For direct multi-target fitting, use `logp_partition.py fit-staged` with a JSON
+stage file. Each evaluation runs the requested LAMMPS partition simulations,
+computes per-target logP errors, and minimizes the stage RMSE:
+
+```bash
+python logp_partition.py fit-staged \
+  --stage-config examples/staged_logp_fit_ethanol.json \
+  --optimizer bayesian \
+  --bo-initial 10 \
+  --bo-grid 20:60:1 \
+  --max-iter 40 \
+  --job 8
+```
 
 In `solubility` mode, bead charges are assigned automatically from the RDKit
 formal charge of each bead SMILES. With the default `--charge_method auto`, the
@@ -217,6 +369,28 @@ Ion `A_ij` values are assigned conservatively: ion-ion and ion-water pairs use
 `charge_summary.csv` reports type counts and net system charge, and
 `smiles_SP.xlsx` records the counterion and water counts.
 
+The same explicit-charge model is also available in `logp_partition.py` for
+logP table fitting and Bayesian optimization. With `--charge-method auto`
+(default), neutral targets continue to use ordinary `pair_style dpd`. If a logP
+bead has a nonzero charge, for example `Na+`, `Cl-`, `COO-`, or
+`CH2OSO3-`, the partition system switches to:
+
+```lammps
+atom_style      full
+pair_style      dpd/coul/slater/long ...
+kspace_style    pppm 1.0e-04
+```
+
+Charged logP solutes are neutralized by adding `Na+` or `Cl-` counterions in
+the water phase. The counterions are excluded from the solute partition
+statistics, while the charged solute molecules remain the logP target. Manual
+charge overrides can be supplied with repeated `--bead-charge BEAD=CHARGE`.
+Relevant options are `--charge-method`, `--charge-lambda`, `--coul-cutoff`,
+`--kspace-accuracy`, and `--charge-unit-scale`.
+When logP fitting is launched from `main.py`, the global charge options are
+forwarded automatically; use `--logp_bead_charge BEAD=CHARGE` for logP-specific
+charge overrides.
+
 Packmol still writes PDB coordinates in its working coordinate scale
 (`--box_size * 10`). During data generation, coordinates are scaled by `0.1` so
 `packed_polymer_and_solution.data` and `lammps.in` both use the reduced LJ box
@@ -227,6 +401,7 @@ python main.py --input_data input_data.txt --param_method solubility --charge_me
 ```
 
 To use a custom LAMMPS executable, pass `--lammps_bin` or set `LAMMPS_BIN`.
+Without either option, OB-DPD tries `lmp_mpi` first and then `lmp`.
 For the locally rebuilt CUDA executable with `dpd/coul/slater/long/gpu` support:
 
 ```bash

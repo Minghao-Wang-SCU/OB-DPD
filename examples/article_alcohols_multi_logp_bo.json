@@ -1,0 +1,67 @@
+{
+  "bead_solubility": {
+    "H2O": 47.9,
+    "CH3": 14.5,
+    "CH2": 16.0,
+    "CH2OH": 29.0
+  },
+  "fixed_overrides": {},
+  "stages": [
+    {
+      "name": "c3_c5_diol_octanol_water_logp",
+      "optimize_pairs": [
+        "H2O:CH3",
+        "H2O:CH2",
+        "H2O:CH2OH",
+        "CH3:CH3",
+        "CH3:CH2",
+        "CH3:CH2OH",
+        "CH2:CH2",
+        "CH2:CH2OH",
+        "CH2OH:CH2OH"
+      ],
+      "max_iter": 40,
+      "organic_solvent": "CH3,CH2,CH2,CH2,CH2,CH2,CH2,CH2OH",
+      "box": [20, 20, 60],
+      "water_count": 17640,
+      "organic_count": 2205,
+      "n_solute": 180,
+      "steps": 1000000,
+      "equilibration_steps": 500000,
+      "timestep": 0.01,
+      "ensemble": "nph",
+      "pressure": 23.7,
+      "pressure_damp": 2.0,
+      "dump_every": 1000,
+      "analysis_method": "ummap",
+      "analysis_frames": 50,
+      "slabs": 30,
+      "interface_gradient_fraction": 0.3,
+      "interface_slab_padding": 1,
+      "angle_param_mode": "article",
+      "allow_custom_beads": true,
+      "targets": [
+        {
+          "name": "1-propanol",
+          "solute": "CH3,CH2,CH2OH",
+          "target_logp": 0.2559
+        },
+        {
+          "name": "1-butanol",
+          "solute": "CH3,CH2,CH2,CH2OH",
+          "target_logp": 0.8459
+        },
+        {
+          "name": "1-pentanol",
+          "solute": "CH3,CH2,CH2,CH2,CH2OH",
+          "target_logp": 1.5159
+        },
+        {
+          "name": "1,4-butanediol",
+          "solute": "CH2OH,CH2,CH2,CH2OH",
+          "target_logp": -0.8011
+        }
+      ]
+    }
+  ]
+}

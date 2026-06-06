@@ -1,0 +1,44 @@
+# Usage:
+#   vmd -e scripts/view_butanol_octanol.vmd
+# Optional:
+#   vmd -dispdev text -e scripts/view_butanol_octanol.vmd
+
+mol new butanol_octanol_article_bo/iter_001/dump.lammpstrj type lammpstrj waitfor all
+
+display projection Orthographic
+display depthcue off
+axes location Off
+color Display Background white
+mol delrep 0 top
+
+# Type map for the article-aligned 1-butanol/octanol/water system:
+# type 1 = CH2, type 2 = CH2OH, type 3 = CH3, type 4 = H2O.
+mol representation VDW 0.35 12
+mol color ColorID 0
+mol selection "type 4"
+mol addrep top
+
+mol representation VDW 0.55 12
+mol color ColorID 1
+mol selection "type 1"
+mol addrep top
+
+mol representation VDW 0.55 12
+mol color ColorID 4
+mol selection "type 2"
+mol addrep top
+
+mol representation VDW 0.55 12
+mol color ColorID 7
+mol selection "type 3"
+mol addrep top
+
+# Highlight solute 1-butanol molecules.
+# Molecule IDs: water 1-17640, octanol 17641-19845, butanol 19846-20025.
+mol representation VDW 0.75 18
+mol color ColorID 3
+mol selection "resid 19846 to 20025"
+mol addrep top
+
+pbc box -color black -width 2
+animate goto 0

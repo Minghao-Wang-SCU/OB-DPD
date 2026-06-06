@@ -51,6 +51,43 @@ LITERATURE_EXTENSION_AIJ = {
 IONIC_TYPES = {"CH2OSO3-", "Na+", "Cl-", "COO-"}
 ALKYL_TYPES = {"CH3", "CH2", "CH3CH2", "CH2CH2"}
 
+DEFAULT_LOGP_BEAD_SOLUBILITY = {
+    "H2O": 47.9,
+    "CH3": 14.5,
+    "CH2": 15.0,
+    "CH3CH2": 15.5,
+    "CH2CH2": 16.0,
+    "CH2OH": 29.0,
+    "CH2NH2": 28.0,
+    "CH2OCH2": 19.0,
+    "CH3OCH2": 18.0,
+    "aCHCH": 18.5,
+    "CH2OSO3-": 33.0,
+    "Na+": 47.9,
+    "Cl-": 47.9,
+    "COO-": 33.0,
+}
+
+KNOWN_BEAD_HEAVY_ATOMS = {
+    "H2O": 1,
+    "2H2O": 2,
+    "CH3": 1,
+    "CH2": 1,
+    "CH3CH2": 2,
+    "CH2CH2": 2,
+    "CH2OH": 2,
+    "CH2NH2": 2,
+    "CH2OCH2": 3,
+    "CH3OCH2": 3,
+    "aCHCH": 2,
+    "CH2OSO3-": 6,
+    "COO-": 3,
+    "Na+": 1,
+    "Cl-": 1,
+}
+
+DEFAULT_HEAVY_ATOM_RADIUS_SCALE = 1.0
+
 
 @dataclass
 class LogpPairResult:
@@ -75,6 +112,18 @@ def canonicalize_smiles(smiles):
 
 def _heavy_atoms(mol):
     return [atom for atom in mol.GetAtoms() if atom.GetAtomicNum() > 1]
+
+
+def heavy_atom_count_from_smiles_or_type(value):
+    if value in KNOWN_BEAD_HEAVY_ATOMS:
+        return int(KNOWN_BEAD_HEAVY_ATOMS[value])
+    canonical = canonicalize_smiles(value)
+    if canonical is None:
+        return np.nan
+    mol = Chem.MolFromSmiles(canonical)
+    if mol is None:
+        return np.nan
+    return len(_heavy_atoms(mol))
 
 
 def _has_formal_charge(mol):
@@ -553,6 +602,49 @@ def interpolated_rij(table, type_i, type_j):
     return 0.5 * (float(r_i) + float(r_j))
 
 
+def self_radius_from_table(table, bead_type):
+    pair = lookup_self_parameter(table, bead_type)
+    if pair is None:
+        return None
+    r_ij = pair.get("R_ij", np.nan)
+    if pd.isna(r_ij):
+        return None
+    return 0.5 * float(r_ij)
+
+
+def heavy_atom_radius(table, bead_type, heavy_count=np.nan, scale=DEFAULT_HEAVY_ATOM_RADIUS_SCALE):
+    table_radius = self_radius_from_table(table, bead_type)
+    if table_radius is not None:
+        return table_radius
+    if pd.isna(heavy_count):
+        heavy_count = KNOWN_BEAD_HEAVY_ATOMS.get(bead_type, np.nan)
+    if pd.isna(heavy_count) or float(heavy_count) <= 0:
+        return None
+    ref_radius = self_radius_from_table(table, "H2O")
+    if ref_radius is None:
+        ref_radius = 0.5
+    ref_count = KNOWN_BEAD_HEAVY_ATOMS.get("H2O", 1)
+    return float(scale) * ref_radius * (float(heavy_count) / float(ref_count)) ** (1.0 / 3.0)
+
+
+def heavy_atom_rij(table, type_i, type_j, heavy_i=np.nan, heavy_j=np.nan, scale=DEFAULT_HEAVY_ATOM_RADIUS_SCALE):
+    radius_i = heavy_atom_radius(table, type_i, heavy_i, scale)
+    radius_j = heavy_atom_radius(table, type_j, heavy_j, scale)
+    if radius_i is None or radius_j is None:
+        return np.nan
+    return float(radius_i + radius_j)
+
+
+def apply_heavy_atom_rij(table, type_i, type_j, r_ij, heavy_i=np.nan, heavy_j=np.nan, mode="missing", scale=DEFAULT_HEAVY_ATOM_RADIUS_SCALE):
+    if mode == "none":
+        return r_ij
+    if mode == "all" or pd.isna(r_ij):
+        corrected = heavy_atom_rij(table, type_i, type_j, heavy_i, heavy_j, scale)
+        if not pd.isna(corrected):
+            return corrected
+    return r_ij
+
+
 def interpolate_ch2_pair(table, type_i, type_j, r_ij):
     if "CH2" not in {type_i, type_j}:
         return None
@@ -659,12 +751,63 @@ def solubility_aij(sigma1, sigma2, same_type=False):
     return 25 + 3.27 * flory_huggins_parameter(sigma1, sigma2)
 
 
-def optimize_missing_logp_params(*args, **kwargs):
-    raise NotImplementedError(
-        "automatic logP fitting is not part of the main parameterization path. "
-        "Use a completed table with --logp_table or run logp_partition.py separately "
-        "for research calibration."
-    )
+def pair_key(type_i, type_j):
+    return tuple(sorted((str(type_i).strip(), str(type_j).strip())))
+
+
+def parse_logp_pair_overrides(values):
+    overrides = {}
+    for value in values or []:
+        try:
+            pair_part, aij_part = value.split("=", 1)
+            type_i, type_j = pair_part.split(":", 1)
+            overrides[pair_key(type_i, type_j)] = float(aij_part)
+        except ValueError as exc:
+            raise ValueError(
+                f"logP manual Aij must look like BEAD1:BEAD2=Aij, got {value}"
+            ) from exc
+    return overrides
+
+
+def bead_solubility_initial(type_i, type_j, same_type=False, bead_solubility=None, default_aij=25.0):
+    bead_solubility = bead_solubility or DEFAULT_LOGP_BEAD_SOLUBILITY
+    sigma_i = bead_solubility.get(type_i)
+    sigma_j = bead_solubility.get(type_j)
+    if sigma_i is None or sigma_j is None:
+        return float(default_aij)
+    return solubility_aij(float(sigma_i), float(sigma_j), same_type=same_type)
+
+
+def assign_distinct_unknown_types(assignments):
+    """Replace generic UNKNOWN labels with stable UNKNOWN1, UNKNOWN2, ... labels.
+
+    The same unknown fragment receives the same label within one parameterization
+    run, while chemically different unknown fragments no longer collapse onto a
+    single bead type.
+    """
+    unknown_map = {}
+    unknown_index = 1
+    for assignment in assignments:
+        if assignment.get("assigned_type") != "UNKNOWN":
+            assignment["unknown_group_key"] = ""
+            assignment["unknown_original_type"] = ""
+            continue
+        canonical = assignment.get("canonical_smiles")
+        if pd.isna(canonical) or canonical in {None, ""}:
+            canonical = assignment.get("smiles", "")
+        key = (
+            str(canonical),
+            str(assignment.get("status", "")),
+            str(assignment.get("reason", "")),
+        )
+        if key not in unknown_map:
+            unknown_map[key] = f"UNKNOWN{unknown_index}"
+            unknown_index += 1
+        assignment["unknown_original_type"] = "UNKNOWN"
+        assignment["unknown_group_key"] = "|".join(key)
+        assignment["assigned_type"] = unknown_map[key]
+        assignment["status"] = f"{assignment.get('status', 'unknown')}_custom"
+    return assignments
 
 
 def create_logp_aij_list(
@@ -673,50 +816,132 @@ def create_logp_aij_list(
     table_path="pdf/logp/machine_readable_interactions.cvs",
     missing="error",
     is_peg_list=None,
+    manual_overrides=None,
+    bead_solubility=None,
+    heavy_atom_correction="missing",
+    heavy_radius_scale=DEFAULT_HEAVY_ATOM_RADIUS_SCALE,
     assignment_output="bead_type_assignment.csv",
     pair_output="a_ij_source.csv",
+    missing_output="missing_logp_pairs.csv",
 ):
-    if missing not in {"fallback", "error", "optimize"}:
-        raise ValueError("missing must be one of: fallback, error, optimize")
+    if missing not in {"fallback", "error", "optimize", "manual"}:
+        raise ValueError("missing must be one of: fallback, error, optimize, manual")
 
     table = load_logp_table(table_path)
+    manual_overrides = manual_overrides or {}
     is_peg_list = is_peg_list or [0] * len(bead_smiles)
-    assignments = [
-        classify_bead_smiles(smiles, is_peg=is_peg_list[idx] if idx < len(is_peg_list) else 0)
-        for idx, smiles in enumerate(bead_smiles)
-    ]
+    assignments = []
+    for idx, smiles in enumerate(bead_smiles):
+        assignment = classify_bead_smiles(smiles, is_peg=is_peg_list[idx] if idx < len(is_peg_list) else 0)
+        assignment["heavy_atom_count"] = heavy_atom_count_from_smiles_or_type(smiles)
+        assignments.append(assignment)
+    assignments = assign_distinct_unknown_types(assignments)
+    for assignment in assignments:
+        if assignment.get("unknown_original_type") == "UNKNOWN":
+            assignment["assigned_type_heavy_atom_count"] = assignment["heavy_atom_count"]
+        else:
+            assignment["assigned_type_heavy_atom_count"] = heavy_atom_count_from_smiles_or_type(assignment["assigned_type"])
     pd.DataFrame(assignments).to_csv(assignment_output, index=False)
 
     a_ij = []
     pair_rows = []
+    missing_rows = []
     count = len(bead_smiles)
     for i in range(count):
         for j in range(i, count):
             type_i = assignments[i]["assigned_type"]
             type_j = assignments[j]["assigned_type"]
+            heavy_i = assignments[i].get("heavy_atom_count", np.nan)
+            heavy_j = assignments[j].get("heavy_atom_count", np.nan)
             pair = None
-            if type_i in LOGP_SUPPORTED_TYPES and type_j in LOGP_SUPPORTED_TYPES:
+            override_key = pair_key(type_i, type_j)
+            if override_key in manual_overrides:
+                pair = {
+                    "A_ij": float(manual_overrides[override_key]),
+                    "R_ij": interpolated_rij(table, type_i, type_j),
+                    "r0": np.nan,
+                    "source": "logp_manual_override",
+                }
+            elif type_i in LOGP_SUPPORTED_TYPES and type_j in LOGP_SUPPORTED_TYPES:
                 pair = lookup_pair_with_interpolation(table, type_i, type_j)
 
             if pair is not None:
                 value = pair["A_ij"]
                 source = pair.get("source", "logp_table")
                 r_ij = pair["R_ij"]
+                if pd.isna(r_ij):
+                    r_ij = interpolated_rij(table, type_i, type_j)
+                r_ij = apply_heavy_atom_rij(
+                    table,
+                    type_i,
+                    type_j,
+                    r_ij,
+                    heavy_i=heavy_i,
+                    heavy_j=heavy_j,
+                    mode=heavy_atom_correction,
+                    scale=heavy_radius_scale,
+                )
                 r0 = pair["r0"]
+            elif missing == "manual":
+                missing_rows.append(
+                    {
+                        "i": i + 1,
+                        "j": j + 1,
+                        "type_i": type_i,
+                        "type_j": type_j,
+                        "reason": "manual override required",
+                    }
+                )
+                continue
             elif missing == "fallback":
                 if solubility_values is None:
-                    raise ValueError("solubility_values are required when missing='fallback'")
-                value = solubility_aij(solubility_values[i], solubility_values[j], i == j)
-                source = "solubility_fallback"
-                r_ij = np.nan
+                    value = bead_solubility_initial(type_i, type_j, i == j, bead_solubility)
+                    source = "solubility_bead_default_fallback"
+                else:
+                    value = solubility_aij(solubility_values[i], solubility_values[j], i == j)
+                    source = "solubility_fallback"
+                r_ij = interpolated_rij(table, type_i, type_j)
+                r_ij = apply_heavy_atom_rij(
+                    table,
+                    type_i,
+                    type_j,
+                    r_ij,
+                    heavy_i=heavy_i,
+                    heavy_j=heavy_j,
+                    mode=heavy_atom_correction,
+                    scale=heavy_radius_scale,
+                )
                 r0 = np.nan
+            elif missing == "optimize":
+                value = bead_solubility_initial(type_i, type_j, i == j, bead_solubility)
+                source = "logp_fit_required_initial_solubility"
+                r_ij = interpolated_rij(table, type_i, type_j)
+                r_ij = apply_heavy_atom_rij(
+                    table,
+                    type_i,
+                    type_j,
+                    r_ij,
+                    heavy_i=heavy_i,
+                    heavy_j=heavy_j,
+                    mode=heavy_atom_correction,
+                    scale=heavy_radius_scale,
+                )
+                r0 = np.nan
+                missing_rows.append(
+                    {
+                        "i": i + 1,
+                        "j": j + 1,
+                        "type_i": type_i,
+                        "type_j": type_j,
+                        "initial_aij": value,
+                        "initial_source": source,
+                    }
+                )
             elif missing == "error":
                 raise ValueError(
                     f"No logP table parameter for pair {i + 1}-{j + 1}: "
                     f"{bead_smiles[i]} ({type_i}) / {bead_smiles[j]} ({type_j})"
                 )
-            else:
-                optimize_missing_logp_params()
 
             a_ij.append((i + 1, j + 1, value))
             pair_rows.append(
@@ -732,5 +957,17 @@ def create_logp_aij_list(
                 ).__dict__
             )
 
+    if missing_rows:
+        pd.DataFrame(missing_rows).to_csv(missing_output, index=False)
+        if missing == "manual":
+            missing_pairs = ", ".join(
+                f"{row['type_i']}:{row['type_j']}" for row in missing_rows
+            )
+            raise ValueError(
+                "manual logP mode requires --logp_manual_aij for every missing "
+                f"pair. Missing pairs: {missing_pairs}. See {missing_output}."
+            )
+    elif os.path.exists(missing_output):
+        os.remove(missing_output)
     pd.DataFrame(pair_rows).to_csv(pair_output, index=False)
     return a_ij, assignments, pair_rows
